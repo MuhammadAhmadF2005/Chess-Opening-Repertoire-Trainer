@@ -68,6 +68,7 @@ export default function App() {
 
   const TreeContainerRef = useRef(null);
   const EngineWorkerRef = useRef(null);
+  const OpponentTimeoutRef = useRef(null);
 
   // Web Audio Context for move and capture sound effects
   const PlaySound = (isCapture = false) => {
@@ -110,6 +111,9 @@ export default function App() {
     return () => {
       if (EngineWorkerRef.current) {
         EngineWorkerRef.current.terminate();
+      }
+      if (OpponentTimeoutRef.current) {
+        clearTimeout(OpponentTimeoutRef.current);
       }
     };
   }, []);
@@ -158,16 +162,16 @@ export default function App() {
       if (typeof Line !== 'string') return;
 
       if (Line.includes('info depth')) {
-        const CpMatch = Line.match(/score cp (-?\d+)/);
-        const MateMatch = Line.match(/score mate (-?\d+)/);
+        const cpMatch = Line.match(/score cp (-?\d+)/);
+        const mateMatch = Line.match(/score mate (-?\d+)/);
 
-        if (CpMatch) {
-          const Score = parseInt(CpMatch[1], 10) / 100;
+        if (cpMatch) {
+          const Score = parseInt(cpMatch[1], 10) / 100;
           // Normalize score to white's perspective
           SetEvalScore(IsWhiteToMove ? Score : -Score);
           SetEvalType('cp');
-        } else if (MateMatch) {
-          const MateIn = parseInt(MateMatch[1], 10);
+        } else if (mateMatch) {
+          const MateIn = parseInt(mateMatch[1], 10);
           // Normalize mate to white's perspective
           SetEvalScore(IsWhiteToMove ? MateIn : -MateIn);
           SetEvalType('mate');
@@ -194,31 +198,33 @@ export default function App() {
     };
   }, [Game]);
 
-  // Build a tree of moves
+  // Build a tree of moves using chessboard wood colors (no blues/greens)
   function BuildMoveTree(MovesArray, CurrentIndex) {
     let RootNode = { 
       name: 'Start', 
       attributes: { status: 'Played', index: 0 },
       nodeSvgShape: {
         shape: 'circle',
-        shapeProps: { r: 12, fill: '#10b981', stroke: '#1e293b', strokeWidth: 2 }
+        shapeProps: { r: 12, fill: '#b58863', stroke: '#1c1917', strokeWidth: 2 }
       }
     };
     let CurrentNode = RootNode;
 
     MovesArray.forEach((Move, Index) => {
+      const isPlayed = Index < CurrentIndex;
+      const isNext = Index === CurrentIndex;
       const NewNode = { 
         name: Move, 
         attributes: { 
-          status: Index < CurrentIndex ? 'Played' : (Index === CurrentIndex ? 'Next' : 'Pending'),
+          status: isPlayed ? 'Played' : (isNext ? 'Next' : 'Pending'),
           index: Index + 1
         },
         nodeSvgShape: {
           shape: 'circle',
           shapeProps: {
             r: 10,
-            fill: Index < CurrentIndex ? '#10b981' : (Index === CurrentIndex ? '#3b82f6' : '#475569'),
-            stroke: '#1e293b',
+            fill: isPlayed ? '#b58863' : (isNext ? '#f0d9b5' : '#57534e'),
+            stroke: '#1c1917',
             strokeWidth: 2
           }
         }
@@ -230,6 +236,11 @@ export default function App() {
   }
 
   function ResetGame(OverrideMoves = ExpectedMoves) {
+    if (OpponentTimeoutRef.current) {
+      clearTimeout(OpponentTimeoutRef.current);
+      OpponentTimeoutRef.current = null;
+    }
+
     const NewGame = new Chess();
     SetLastError('');
     SetDetectedOpening('Starting Position');
@@ -244,9 +255,39 @@ export default function App() {
     SetGame(NewGame);
   }
 
+  const AutoPlayOpponentMove = (CurrentGameCopy, MoveIndex) => {
+    if (MoveIndex >= ExpectedMoves.length) {
+      SetLastError("Opening sequence completed!");
+      return;
+    }
+
+    const NextMove = ExpectedMoves[MoveIndex];
+    
+    if (OpponentTimeoutRef.current) {
+      clearTimeout(OpponentTimeoutRef.current);
+    }
+
+    OpponentTimeoutRef.current = setTimeout(() => {
+      const AutoGameCopy = new Chess();
+      AutoGameCopy.loadPgn(CurrentGameCopy.pgn());
+      
+      const MoveResult = AutoGameCopy.move(NextMove);
+      SetGame(AutoGameCopy);
+      BuildMoveTree(ExpectedMoves, MoveIndex + 1);
+      PlaySound(MoveResult.captured !== undefined);
+      OpponentTimeoutRef.current = null;
+    }, 500);
+  };
+
   // Handle Tree Node clicks to jump the board state
   const HandleNodeClick = (NodeDatum) => {
     if (!IsTrainerMode) return;
+    
+    if (OpponentTimeoutRef.current) {
+      clearTimeout(OpponentTimeoutRef.current);
+      OpponentTimeoutRef.current = null;
+    }
+
     const TargetIndex = NodeDatum.attributes?.index !== undefined ? parseInt(NodeDatum.attributes.index, 10) : 0;
     
     const NewGame = new Chess();
@@ -259,25 +300,13 @@ export default function App() {
     BuildMoveTree(ExpectedMoves, TargetIndex);
     SetLastError('');
     PlaySound(false);
-  };
 
-  const AutoPlayOpponentMove = (CurrentGameCopy, MoveIndex) => {
-    if (MoveIndex >= ExpectedMoves.length) {
-      SetLastError("Opening sequence completed!");
-      return;
+    // Trigger opponent response if it's their turn
+    if (PlayerColor === 'w' && TargetIndex % 2 !== 0) {
+      AutoPlayOpponentMove(NewGame, TargetIndex);
+    } else if (PlayerColor === 'b' && TargetIndex % 2 === 0) {
+      AutoPlayOpponentMove(NewGame, TargetIndex);
     }
-
-    const NextMove = ExpectedMoves[MoveIndex];
-    
-    setTimeout(() => {
-      const AutoGameCopy = new Chess();
-      AutoGameCopy.loadPgn(CurrentGameCopy.pgn());
-      
-      const MoveResult = AutoGameCopy.move(NextMove);
-      SetGame(AutoGameCopy);
-      BuildMoveTree(ExpectedMoves, MoveIndex + 1);
-      PlaySound(MoveResult.captured !== undefined);
-    }, 500);
   };
 
   const EvaluateDeviation = async (ExpectedFen, ActualFen, ExpectedMove, PlayedMove) => {
@@ -329,10 +358,19 @@ export default function App() {
     SetLastError(`Mistake! Expected ${ExpectedMove}, but you played ${PlayedMove}. Evaluation dropped by ${Math.max(0, Drop).toFixed(1)} points.`);
   };
 
-  function OnPieceDrop({ sourceSquare, targetSquare }) {
+  function OnPieceDrop(sourceSquare, targetSquare) {
     const GameCopy = new Chess();
     GameCopy.loadPgn(Game.pgn());
     const CurrentMoveIndex = GameCopy.history().length;
+
+    // Reject move immediately if it is not the user's turn to move in Trainer Mode
+    if (IsTrainerMode) {
+      const isPlayerTurn = (PlayerColor === 'w' && CurrentMoveIndex % 2 === 0) || 
+                            (PlayerColor === 'b' && CurrentMoveIndex % 2 !== 0);
+      if (!isPlayerTurn) {
+        return false;
+      }
+    }
 
     try {
       const MoveResult = GameCopy.move({ from: sourceSquare, to: targetSquare, promotion: "q" });
@@ -482,28 +520,28 @@ export default function App() {
   };
 
   return (
-    <div className="flex h-screen w-full bg-slate-950 text-slate-100 overflow-hidden font-sans select-none">
+    <div className="flex h-screen w-full bg-stone-950 text-stone-100 overflow-hidden font-sans select-none">
       
       {/* Sidebar - Control and Analysis Panel */}
-      <div className="w-[420px] flex flex-col border-r border-slate-800 bg-slate-900/90 shadow-2xl z-10 relative">
+      <div className="w-[420px] flex flex-col border-r border-stone-800 bg-stone-900 shadow-2xl z-10 relative">
         
         {/* Sidebar Header */}
-        <div className="p-5 border-b border-slate-800 flex flex-col gap-3">
+        <div className="p-5 border-b border-stone-800 flex flex-col gap-3">
           <div className="flex justify-between items-center">
-            <h1 className="text-xl font-bold bg-gradient-to-r from-blue-400 via-indigo-400 to-emerald-400 bg-clip-text text-transparent flex items-center gap-2">
-              <span>♟️ Repertoire Trainer</span>
+            <h1 className="text-xl font-bold font-serif text-[#b58863] flex items-center gap-2 tracking-wide">
+              <span>Chess Repertoire Trainer</span>
             </h1>
             <div className="flex gap-2">
               <button 
                 onClick={() => SetMuted(!Muted)} 
-                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
+                className="p-1.5 rounded-lg bg-stone-850 hover:bg-stone-800 text-stone-300 transition-colors"
                 title={Muted ? "Unmute sound effects" : "Mute sound effects"}
               >
-                {Muted ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
+                {Muted ? <VolumeX className="w-4 h-4 text-stone-400" /> : <Volume2 className="w-4 h-4 text-stone-300" />}
               </button>
               <button 
                 onClick={() => ResetGame()} 
-                className="p-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors flex items-center gap-1 text-xs"
+                className="p-1.5 rounded-lg bg-stone-850 hover:bg-stone-800 text-stone-300 transition-colors"
                 title="Reset active board"
               >
                 <RefreshCw className="w-4 h-4" />
@@ -512,17 +550,17 @@ export default function App() {
           </div>
           
           {/* Mode Switcher Buttons */}
-          <div className="grid grid-cols-2 gap-2 bg-slate-950 p-1 rounded-lg border border-slate-800/80">
+          <div className="grid grid-cols-2 gap-2 bg-stone-950 p-1 rounded-lg border border-stone-800">
             <button 
               onClick={() => SetIsTrainerMode(false)}
-              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${!IsTrainerMode ? 'bg-blue-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'}`}
+              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${!IsTrainerMode ? 'bg-[#b58863] text-stone-950 shadow-md font-bold' : 'text-stone-400 hover:text-stone-200'}`}
             >
               <Eye className="w-3.5 h-3.5" />
               <span>Observation</span>
             </button>
             <button 
               onClick={() => SetIsTrainerMode(true)}
-              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${IsTrainerMode ? 'bg-emerald-600 text-white shadow-md' : 'text-slate-400 hover:text-slate-200'}`}
+              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${IsTrainerMode ? 'bg-[#b58863] text-stone-950 shadow-md font-bold' : 'text-slate-400 hover:text-slate-200'}`}
             >
               <BookOpen className="w-3.5 h-3.5" />
               <span>Trainer Mode</span>
@@ -534,22 +572,22 @@ export default function App() {
         <div className="flex-1 overflow-y-auto p-5 space-y-5">
           {IsLoadingEco ? (
             <div className="flex flex-col items-center justify-center h-full gap-2 py-10">
-              <Loader2 className="w-8 h-8 animate-spin text-blue-500" />
-              <span className="text-sm text-slate-400 font-medium">Loading ECO opening database...</span>
+              <Loader2 className="w-8 h-8 animate-spin text-[#b58863]" />
+              <span className="text-sm text-stone-400 font-medium">Loading ECO database...</span>
             </div>
           ) : (
             <div className="space-y-4">
               
               {/* Trainer Mode Selection Panel */}
               {IsTrainerMode ? (
-                <div className="bg-slate-950/40 border border-slate-800/80 p-4 rounded-xl space-y-4 shadow-inner">
+                <div className="bg-stone-950/40 border border-stone-800/80 p-4 rounded-xl space-y-4 shadow-inner">
                   {/* Select Opening Row */}
                   <div>
                     <div className="flex justify-between items-center mb-1.5">
-                      <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Target opening</label>
+                      <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Target opening</label>
                       <button 
                         onClick={() => SetAddModalOpen(true)}
-                        className="text-xs text-blue-400 hover:text-blue-300 flex items-center gap-0.5 hover:underline font-medium"
+                        className="text-xs text-[#b58863] hover:text-[#c99c75] flex items-center gap-0.5 font-medium hover:underline"
                       >
                         <Plus className="w-3.5 h-3.5" />
                         <span>Add Custom</span>
@@ -562,14 +600,14 @@ export default function App() {
                           const Selected = Repertoire.find(Op => Op.Name === e.target.value);
                           if (Selected) SetTargetOpening(Selected);
                         }}
-                        className="flex-1 bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
+                        className="flex-1 bg-stone-900 border border-stone-800 rounded-lg p-2 text-sm text-stone-200 focus:outline-none focus:border-[#b58863]"
                       >
                         {Repertoire.map(Op => <option key={Op.Name} value={Op.Name}>{Op.Name}</option>)}
                       </select>
                       {Repertoire.length > 1 && !PopularOpenings.some(pop => pop.Name === TargetOpening.Name) && (
                         <button 
                           onClick={() => HandleDeleteOpening(TargetOpening.Name)}
-                          className="p-2 bg-red-950/20 text-red-400 hover:bg-red-900/40 rounded-lg border border-red-900/30 transition-colors"
+                          className="p-2 bg-red-950/10 text-red-400 hover:bg-red-900/20 rounded-lg border border-red-900/20 transition-colors"
                           title="Delete custom opening"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -580,17 +618,17 @@ export default function App() {
 
                   {/* Play As Select Row */}
                   <div>
-                    <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Practice As</label>
-                    <div className="grid grid-cols-2 gap-2 bg-slate-900 p-1 rounded-lg border border-slate-700/50">
+                    <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">Practice As</label>
+                    <div className="grid grid-cols-2 gap-2 bg-stone-900 p-1 rounded-lg border border-stone-800/50">
                       <button 
                         onClick={() => SetPlayerColor('w')}
-                        className={`py-1 text-xs font-medium rounded transition-all ${PlayerColor === 'w' ? 'bg-slate-100 text-slate-950 font-bold shadow' : 'text-slate-400 hover:text-slate-200'}`}
+                        className={`py-1 text-xs font-medium rounded transition-all ${PlayerColor === 'w' ? 'bg-[#f0d9b5] text-stone-950 font-bold shadow' : 'text-stone-400 hover:text-stone-200'}`}
                       >
                         White
                       </button>
                       <button 
                         onClick={() => SetPlayerColor('b')}
-                        className={`py-1 text-xs font-medium rounded transition-all ${PlayerColor === 'b' ? 'bg-slate-800 text-white font-bold border border-slate-600' : 'text-slate-400 hover:text-slate-200'}`}
+                        className={`py-1 text-xs font-medium rounded transition-all ${PlayerColor === 'b' ? 'bg-[#f0d9b5] text-stone-950 font-bold shadow' : 'text-stone-400 hover:text-stone-200'}`}
                       >
                         Black
                       </button>
@@ -599,18 +637,18 @@ export default function App() {
                 </div>
               ) : (
                 /* Observation Mode Context Panel */
-                <div className="bg-gradient-to-r from-blue-950/20 to-slate-900 border border-slate-800/80 p-4 rounded-xl text-center shadow">
-                  <span className="text-[10px] font-bold text-blue-400 uppercase tracking-wider block mb-1">Detected Position Theory</span>
-                  <div className="text-base font-bold text-emerald-400 leading-tight">{DetectedOpening}</div>
+                <div className="bg-stone-950/40 border border-stone-800 p-4 rounded-xl text-center shadow">
+                  <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider block mb-1">Detected Position Theory</span>
+                  <div className="text-base font-bold text-[#b58863] leading-tight">{DetectedOpening}</div>
                 </div>
               )}
 
               {/* Move Visualizer Tree Diagram */}
               {IsTrainerMode && (
-                <div className="bg-slate-950/50 border border-slate-800/80 rounded-xl overflow-hidden shadow-inner flex flex-col">
-                  <div className="bg-slate-900/80 px-4 py-2 border-b border-slate-800/60 flex items-center justify-between">
-                    <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Expected Move Sequence</span>
-                    <span className="text-[10px] text-slate-500 flex items-center gap-0.5">
+                <div className="bg-stone-950/40 border border-stone-800 p-4 rounded-xl overflow-hidden shadow-inner flex flex-col">
+                  <div className="pb-2 border-b border-stone-800 flex items-center justify-between">
+                    <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Expected Move Sequence</span>
+                    <span className="text-[10px] text-stone-500 flex items-center gap-0.5">
                       <HelpCircle className="w-3 h-3" />
                       <span>Click node to jump</span>
                     </span>
@@ -625,15 +663,15 @@ export default function App() {
                       onNodeClick={HandleNodeClick}
                       textLayout={{ textAnchor: "middle", y: 22 }}
                       styles={{
-                        links: { stroke: '#334155', strokeWidth: 2 },
+                        links: { stroke: '#44403c', strokeWidth: 2 },
                         nodes: { 
                           node: { 
                             circle: { cursor: 'pointer' },
-                            name: { fill: '#cbd5e1', fontSize: 11, fontWeight: '600', fontFamily: 'monospace' } 
+                            name: { fill: '#e7e5e4', fontSize: 11, fontWeight: '600', fontFamily: 'monospace' } 
                           },
                           leafNode: { 
                             circle: { cursor: 'pointer' },
-                            name: { fill: '#cbd5e1', fontSize: 11, fontWeight: '600', fontFamily: 'monospace' } 
+                            name: { fill: '#e7e5e4', fontSize: 11, fontWeight: '600', fontFamily: 'monospace' } 
                           } 
                         }
                       }}
@@ -643,20 +681,20 @@ export default function App() {
               )}
 
               {/* Game Notation Scroll Panel */}
-              <div className="bg-slate-950/30 border border-slate-800/80 rounded-xl overflow-hidden shadow flex flex-col">
-                <div className="bg-slate-900/60 px-4 py-2 border-b border-slate-800/60">
-                  <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Move Log</span>
+              <div className="bg-stone-950/30 border border-stone-800 rounded-xl overflow-hidden shadow flex flex-col">
+                <div className="bg-stone-900/60 px-4 py-2 border-b border-stone-800">
+                  <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Move Log</span>
                 </div>
-                <div className="p-3 h-[180px] overflow-y-auto font-mono text-sm space-y-1 bg-slate-950/60">
+                <div className="p-3 h-[180px] overflow-y-auto font-mono text-sm space-y-1 bg-stone-950/40">
                   {RenderMoveHistory().length === 0 ? (
-                    <div className="text-slate-600 text-xs italic text-center py-10">No moves played yet.</div>
+                    <div className="text-stone-600 text-xs italic text-center py-10">No moves played yet.</div>
                   ) : (
                     <div className="grid grid-cols-3 gap-y-1 gap-x-4 max-w-xs text-left mx-auto">
                       {RenderMoveHistory().map((pair) => (
                         <div key={pair.num} className="contents">
-                          <span className="text-slate-600 text-right">{pair.num}.</span>
-                          <span className="text-slate-200 font-semibold">{pair.w}</span>
-                          <span className="text-slate-400">{pair.b}</span>
+                          <span className="text-stone-600 text-right">{pair.num}.</span>
+                          <span className="text-stone-200 font-semibold">{pair.w}</span>
+                          <span className="text-stone-400">{pair.b}</span>
                         </div>
                       ))}
                     </div>
@@ -670,7 +708,7 @@ export default function App() {
       </div>
 
       {/* Main Chessboard Board Area */}
-      <div className="flex-1 flex flex-col items-center justify-center bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 relative p-8">
+      <div className="flex-1 flex flex-col items-center justify-center bg-gradient-to-br from-stone-950 via-stone-900 to-stone-950 relative p-8">
         
         {/* Live Evaluation/Status Display */}
         <div className="mb-4 text-center h-10 flex items-center justify-center">
@@ -680,8 +718,8 @@ export default function App() {
             </div>
           ) : (
             IsEvaluating && (
-              <div className="text-slate-500 font-mono text-xs flex items-center gap-1.5">
-                <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-400" />
+              <div className="text-stone-500 font-mono text-xs flex items-center gap-1.5">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-stone-400" />
                 <span>Stockfish analyzing...</span>
               </div>
             )
@@ -691,22 +729,22 @@ export default function App() {
         {/* Board and Evaluation Bar Wrapper */}
         <div className="flex items-center">
           
-          {/* Vertical Live Stockfish Evaluation Bar */}
-          <div className="mr-5 flex flex-col items-center justify-between h-[560px] w-6 bg-slate-950 border border-slate-800 rounded-md overflow-hidden relative shadow-2xl">
-            {/* Black Score Section */}
+          {/* Vertical Live Stockfish Evaluation Bar (chessboard-matching colors) */}
+          <div className="mr-5 flex flex-col items-center justify-between h-[560px] w-6 bg-stone-950 border border-stone-800 rounded-md overflow-hidden relative shadow-2xl">
+            {/* Black Score Section (using board-dark color) */}
             <div 
-              className="w-full bg-slate-900 transition-all duration-300 ease-out" 
+              className="w-full bg-[#b58863] transition-all duration-300 ease-out" 
               style={{ height: `${100 - WhitePct}%` }} 
             />
-            {/* White Score Section */}
+            {/* White Score Section (using board-light color) */}
             <div 
-              className="w-full bg-slate-100 transition-all duration-300 ease-out" 
+              className="w-full bg-[#f0d9b5] transition-all duration-300 ease-out" 
               style={{ height: `${WhitePct}%` }} 
             />
             
             {/* Overlay Indicator Text */}
             <div className="absolute inset-x-0 bottom-2 text-center pointer-events-none select-none">
-              <span className={`text-[9px] font-extrabold px-1 py-0.5 rounded shadow-sm ${WhitePct > 50 ? 'bg-slate-900 text-white' : 'bg-white text-slate-900'}`}>
+              <span className="text-[9px] font-extrabold px-1 py-0.5 rounded shadow-sm bg-stone-950 text-stone-100 border border-stone-800">
                 {EvalType === 'mate' 
                   ? (EvalScore > 0 ? `M${EvalScore}` : `-M${Math.abs(EvalScore)}`) 
                   : `${EvalScore > 0 ? '+' : ''}${EvalScore.toFixed(1)}`
@@ -717,26 +755,26 @@ export default function App() {
 
           {/* Graphical Chessboard */}
           <div className="w-[560px] h-[560px] relative select-none">
-            <Chessboard options={ChessboardOptions} />
+            <Chessboard {...ChessboardOptions} />
           </div>
         </div>
 
         {/* Visual Board Footer */}
-        <div className="mt-4 text-slate-500 text-[11px] font-mono select-none">
+        <div className="mt-4 text-stone-500 text-[11px] font-mono select-none">
           Drag and drop pieces to play theory. Deviations trigger automatic Stockfish analysis.
         </div>
       </div>
 
       {/* Add Custom Opening Modal Overlay */}
       {AddModalOpen && (
-        <div className="absolute inset-0 bg-slate-950/70 backdrop-blur-sm flex items-center justify-center z-50 p-4 transition-all">
-          <div className="w-[480px] bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-250">
+        <div className="absolute inset-0 bg-stone-950/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 transition-all">
+          <div className="w-[480px] bg-stone-900 border border-stone-800 rounded-2xl shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-250">
             {/* Modal Header */}
-            <div className="px-5 py-4 border-b border-slate-800 flex justify-between items-center bg-slate-950/30">
-              <h3 className="text-base font-bold text-slate-200">Add Custom Practice Opening</h3>
+            <div className="px-5 py-4 border-b border-stone-800 flex justify-between items-center bg-stone-950/30">
+              <h3 className="text-base font-bold text-stone-200">Add Custom Practice Opening</h3>
               <button 
                 onClick={() => SetAddModalOpen(false)}
-                className="text-slate-400 hover:text-slate-200 p-1 hover:bg-slate-800 rounded-lg transition-colors"
+                className="text-stone-400 hover:text-stone-200 p-1 hover:bg-stone-800 rounded-lg transition-colors"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -745,13 +783,13 @@ export default function App() {
             {/* Modal Form */}
             <form onSubmit={HandleSaveOpening} className="p-5 space-y-4">
               <div>
-                <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Opening Name</label>
+                <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">Opening Name</label>
                 <input 
                   type="text" 
                   value={NewOpeningName}
                   onChange={(e) => SetNewOpeningName(e.target.value)}
                   placeholder="e.g. Sicilian Defense: Najdorf Variation"
-                  className="w-full bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-lg p-2.5 text-sm text-slate-200 focus:outline-none"
+                  className="w-full bg-slate-950 border border-stone-800 focus:border-[#b58863] rounded-lg p-2.5 text-sm text-stone-200 focus:outline-none"
                 />
               </div>
 
@@ -762,7 +800,7 @@ export default function App() {
                   value={NewOpeningMoves}
                   onChange={(e) => SetNewOpeningMoves(e.target.value)}
                   placeholder="e.g. 1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nf6 5. Nc3 a6"
-                  className="w-full bg-slate-950 border border-slate-800 focus:border-blue-500 rounded-lg p-2.5 text-sm text-slate-200 font-mono focus:outline-none resize-none"
+                  className="w-full bg-slate-950 border border-stone-800 focus:border-[#b58863] rounded-lg p-2.5 text-sm text-stone-200 font-mono focus:outline-none resize-none"
                 />
               </div>
 
@@ -777,13 +815,13 @@ export default function App() {
                 <button 
                   type="button"
                   onClick={() => SetAddModalOpen(false)}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg text-xs transition-colors"
+                  className="px-4 py-2 bg-stone-800 hover:bg-stone-750 text-stone-300 font-semibold rounded-lg text-xs transition-colors"
                 >
                   Cancel
                 </button>
                 <button 
                   type="submit"
-                  className="px-4 py-2 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg text-xs transition-colors shadow-lg shadow-blue-500/15"
+                  className="px-4 py-2 bg-[#b58863] hover:bg-[#c99c75] text-stone-950 font-bold rounded-lg text-xs transition-colors"
                 >
                   Save Opening
                 </button>
