@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { Chess } from 'chess.js';
 import { Chessboard } from 'react-chessboard';
 import { openingBook, lookupByMoves } from '@chess-openings/eco.json';
@@ -31,548 +31,666 @@ const PopularOpenings = [
   { Name: "French Defense", Moves: "1. e4 e6 2. d4 d5 3. Nc3 Nf6" }
 ];
 
+/**
+ * Helper: Clone a Chess.js game by replaying its PGN into a fresh instance.
+ * This guarantees a distinct object identity so React always detects state changes.
+ */
+function cloneGame(game) {
+  const copy = new Chess();
+  const pgn = game.pgn();
+  if (pgn) {
+    copy.loadPgn(pgn);
+  }
+  return copy;
+}
+
+/**
+ * Helper: Parse a PGN string into an array of SAN moves.
+ */
+function pgnToMoves(pgn) {
+  const temp = new Chess();
+  try {
+    temp.loadPgn(pgn);
+    return temp.history();
+  } catch {
+    return [];
+  }
+}
+
 export default function App() {
-  const [Game, SetGame] = useState(new Chess());
-  const [Openings, SetOpenings] = useState(null);
-  const [DetectedOpening, SetDetectedOpening] = useState('Starting Position');
-  const [IsLoadingEco, SetIsLoadingEco] = useState(true);
-  const [LastError, SetLastError] = useState('');
-  
-  // Repertoire state loaded from LocalStorage
-  const [Repertoire, SetRepertoire] = useState(() => {
-    const Saved = localStorage.getItem('chess_repertoire');
-    if (Saved) {
-      try {
-        return JSON.parse(Saved);
-      } catch (e) {
-        console.error("Failed to parse chess repertoire from localStorage", e);
-      }
+  // ──────────────────────── Core game state ────────────────────────
+  const [game, setGame] = useState(new Chess());
+  const [openings, setOpenings] = useState(null);
+  const [detectedOpening, setDetectedOpening] = useState('Starting Position');
+  const [isLoadingEco, setIsLoadingEco] = useState(true);
+  const [lastError, setLastError] = useState('');
+
+  // Repertoire state (persisted in localStorage)
+  const [repertoire, setRepertoire] = useState(() => {
+    const saved = localStorage.getItem('chess_repertoire');
+    if (saved) {
+      try { return JSON.parse(saved); } catch { /* ignore */ }
     }
     return PopularOpenings;
   });
 
   // Trainer Mode Settings
-  const [IsTrainerMode, SetIsTrainerMode] = useState(false);
-  const [PlayerColor, SetPlayerColor] = useState('w');
-  const [TargetOpening, SetTargetOpening] = useState(Repertoire[0] || PopularOpenings[0]);
-  const [ExpectedMoves, SetExpectedMoves] = useState([]);
-  const [TreeData, SetTreeData] = useState({ name: 'Start' });
-  const [Muted, SetMuted] = useState(false);
+  const [isTrainerMode, setIsTrainerMode] = useState(false);
+  const [playerColor, setPlayerColor] = useState('w');
+  const [targetOpening, setTargetOpening] = useState(() => {
+    const saved = localStorage.getItem('chess_repertoire');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (parsed.length > 0) return parsed[0];
+      } catch { /* ignore */ }
+    }
+    return PopularOpenings[0];
+  });
+  const [expectedMoves, setExpectedMoves] = useState([]);
+  const [treeData, setTreeData] = useState({ name: 'Start' });
+  const [muted, setMuted] = useState(false);
 
   // Live evaluation states
-  const [EvalScore, SetEvalScore] = useState(0.3); // Starting eval slightly favors white
-  const [EvalType, SetEvalType] = useState('cp');
-  const [IsEvaluating, SetIsEvaluating] = useState(false);
+  const [evalScore, setEvalScore] = useState(0.3);
+  const [evalType, setEvalType] = useState('cp');
+  const [isEvaluating, setIsEvaluating] = useState(false);
 
   // Custom opening modal states
-  const [AddModalOpen, SetAddModalOpen] = useState(false);
-  const [NewOpeningName, SetNewOpeningName] = useState('');
-  const [NewOpeningMoves, SetNewOpeningMoves] = useState('');
-  const [AddError, SetAddError] = useState('');
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [newOpeningName, setNewOpeningName] = useState('');
+  const [newOpeningMoves, setNewOpeningMoves] = useState('');
+  const [addError, setAddError] = useState('');
 
-  const TreeContainerRef = useRef(null);
-  const EngineWorkerRef = useRef(null);
-  const OpponentTimeoutRef = useRef(null);
+  // Refs
+  const treeContainerRef = useRef(null);
+  const engineWorkerRef = useRef(null);
+  const opponentTimeoutRef = useRef(null);
 
-  // Web Audio Context for move and capture sound effects
-  const PlaySound = (isCapture = false) => {
-    if (Muted) return;
+  // ──────────────────────── Audio ────────────────────────
+  const playSound = useCallback((isCapture = false) => {
+    if (muted) return;
     try {
-      const AudioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      const Osc = AudioCtx.createOscillator();
-      const GainNode = AudioCtx.createGain();
-      
-      Osc.connect(GainNode);
-      GainNode.connect(AudioCtx.destination);
-      
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
       if (isCapture) {
-        // Double tone pulse for captures
-        Osc.type = 'triangle';
-        Osc.frequency.setValueAtTime(320, AudioCtx.currentTime);
-        Osc.frequency.exponentialRampToValueAtTime(140, AudioCtx.currentTime + 0.15);
-        GainNode.gain.setValueAtTime(0.15, AudioCtx.currentTime);
-        GainNode.gain.exponentialRampToValueAtTime(0.01, AudioCtx.currentTime + 0.15);
-        Osc.start();
-        Osc.stop(AudioCtx.currentTime + 0.15);
+        osc.type = 'triangle';
+        osc.frequency.setValueAtTime(320, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(140, ctx.currentTime + 0.15);
+        gain.gain.setValueAtTime(0.15, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.15);
       } else {
-        // High to low pop for normal moves
-        Osc.type = 'sine';
-        Osc.frequency.setValueAtTime(400, AudioCtx.currentTime);
-        Osc.frequency.exponentialRampToValueAtTime(260, AudioCtx.currentTime + 0.08);
-        GainNode.gain.setValueAtTime(0.1, AudioCtx.currentTime);
-        GainNode.gain.exponentialRampToValueAtTime(0.01, AudioCtx.currentTime + 0.08);
-        Osc.start();
-        Osc.stop(AudioCtx.currentTime + 0.08);
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(400, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(260, ctx.currentTime + 0.08);
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.08);
+        osc.start();
+        osc.stop(ctx.currentTime + 0.08);
       }
+    } catch {
+      // Web Audio not available
+    }
+  }, [muted]);
+
+  // ──────────────────────── Stockfish worker init ────────────────────────
+  useEffect(() => {
+    try {
+      const wasmSupported =
+        typeof WebAssembly === 'object' &&
+        WebAssembly.validate(Uint8Array.of(0x0, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00));
+      engineWorkerRef.current = new Worker(
+        wasmSupported ? '/stockfish.wasm.js' : '/stockfish.js'
+      );
     } catch (e) {
-      console.warn("Web Audio API failed to initialize", e);
+      console.warn('Failed to initialize Stockfish worker:', e);
     }
-  };
 
-  // 1. Initialize Stockfish worker using native Worker loaded as static asset
-  useEffect(() => {
-    const wasmSupported = typeof WebAssembly === 'object' && WebAssembly.validate(Uint8Array.of(0x0, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00));
-    EngineWorkerRef.current = new Worker(wasmSupported ? '/stockfish.wasm.js' : '/stockfish.js');
     return () => {
-      if (EngineWorkerRef.current) {
-        EngineWorkerRef.current.terminate();
+      if (engineWorkerRef.current) {
+        engineWorkerRef.current.terminate();
+        engineWorkerRef.current = null;
       }
-      if (OpponentTimeoutRef.current) {
-        clearTimeout(OpponentTimeoutRef.current);
+      if (opponentTimeoutRef.current) {
+        clearTimeout(opponentTimeoutRef.current);
       }
     };
   }, []);
 
-  // 2. Load opening ECO database
+  // ──────────────────────── ECO database loading ────────────────────────
   useEffect(() => {
-    openingBook().then((Data) => {
-      SetOpenings(Data);
-      SetIsLoadingEco(false);
-    }).catch((Error) => {
-      console.error("Failed to load ECO database", Error);
-      SetIsLoadingEco(false);
-    });
+    openingBook()
+      .then((data) => {
+        setOpenings(data);
+        setIsLoadingEco(false);
+      })
+      .catch((err) => {
+        console.error('Failed to load ECO database:', err);
+        setIsLoadingEco(false);
+      });
   }, []);
 
-  // 3. Keep target opening synchronized
-  useEffect(() => {
-    if (TargetOpening) {
-      const TempGame = new Chess();
-      try {
-        TempGame.loadPgn(TargetOpening.Moves);
-        const MovesArray = TempGame.history();
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-        SetExpectedMoves(MovesArray);
-        ResetGame(MovesArray);
-      } catch (err) {
-        console.error("Error parsing target opening PGN", err);
-      }
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [TargetOpening, PlayerColor, IsTrainerMode]);
-
-  // 4. Background Stockfish Position Evaluator on every Board State change
-  useEffect(() => {
-    if (!EngineWorkerRef.current) return;
-
-    // Interrupt any active analysis
-    EngineWorkerRef.current.postMessage('stop');
-    SetIsEvaluating(true);
-
-    const Fen = Game.fen();
-    const IsWhiteToMove = Fen.split(' ')[1] === 'w';
-
-    const Listener = (e) => {
-      const Line = e.data;
-      if (typeof Line !== 'string') return;
-
-      if (Line.includes('info depth')) {
-        const cpMatch = Line.match(/score cp (-?\d+)/);
-        const mateMatch = Line.match(/score mate (-?\d+)/);
-
-        if (cpMatch) {
-          const Score = parseInt(cpMatch[1], 10) / 100;
-          // Normalize score to white's perspective
-          SetEvalScore(IsWhiteToMove ? Score : -Score);
-          SetEvalType('cp');
-        } else if (mateMatch) {
-          const MateIn = parseInt(mateMatch[1], 10);
-          // Normalize mate to white's perspective
-          SetEvalScore(IsWhiteToMove ? MateIn : -MateIn);
-          SetEvalType('mate');
-        }
-      }
-
-      if (Line.startsWith('bestmove')) {
-        SetIsEvaluating(false);
-        EngineWorkerRef.current.removeEventListener('message', Listener);
-      }
-    };
-
-    EngineWorkerRef.current.addEventListener('message', Listener);
-    EngineWorkerRef.current.postMessage('ucinewgame');
-    EngineWorkerRef.current.postMessage('position fen ' + Fen);
-    // Depth 12 is extremely fast (under 400ms) but very accurate for opening evaluation
-    EngineWorkerRef.current.postMessage('go depth 12');
-
-    return () => {
-      if (EngineWorkerRef.current) {
-        EngineWorkerRef.current.postMessage('stop');
-        EngineWorkerRef.current.removeEventListener('message', Listener);
-      }
-    };
-  }, [Game]);
-
-  // Build a tree of moves using chessboard wood colors (no blues/greens)
-  function BuildMoveTree(MovesArray, CurrentIndex) {
-    let RootNode = { 
-      name: 'Start', 
+  // ──────────────────────── Move tree builder ────────────────────────
+  const buildMoveTree = useCallback((movesArray, currentIndex) => {
+    const rootNode = {
+      name: 'Start',
       attributes: { status: 'Played', index: 0 },
       nodeSvgShape: {
         shape: 'circle',
-        shapeProps: { r: 12, fill: '#b58863', stroke: '#1c1917', strokeWidth: 2 }
-      }
+        shapeProps: { r: 12, fill: '#b58863', stroke: '#1c1917', strokeWidth: 2 },
+      },
     };
-    let CurrentNode = RootNode;
+    let currentNode = rootNode;
 
-    MovesArray.forEach((Move, Index) => {
-      const isPlayed = Index < CurrentIndex;
-      const isNext = Index === CurrentIndex;
-      const NewNode = { 
-        name: Move, 
-        attributes: { 
-          status: isPlayed ? 'Played' : (isNext ? 'Next' : 'Pending'),
-          index: Index + 1
+    movesArray.forEach((move, idx) => {
+      const isPlayed = idx < currentIndex;
+      const isNext = idx === currentIndex;
+      const newNode = {
+        name: move,
+        attributes: {
+          status: isPlayed ? 'Played' : isNext ? 'Next' : 'Pending',
+          index: idx + 1,
         },
         nodeSvgShape: {
           shape: 'circle',
           shapeProps: {
             r: 10,
-            fill: isPlayed ? '#b58863' : (isNext ? '#f0d9b5' : '#57534e'),
+            fill: isPlayed ? '#b58863' : isNext ? '#f0d9b5' : '#57534e',
             stroke: '#1c1917',
-            strokeWidth: 2
-          }
-        }
+            strokeWidth: 2,
+          },
+        },
       };
-      CurrentNode.children = [NewNode];
-      CurrentNode = NewNode;
+      currentNode.children = [newNode];
+      currentNode = newNode;
     });
-    SetTreeData(RootNode);
-  }
 
-  function ResetGame(OverrideMoves = ExpectedMoves) {
-    if (OpponentTimeoutRef.current) {
-      clearTimeout(OpponentTimeoutRef.current);
-      OpponentTimeoutRef.current = null;
-    }
+    setTreeData(rootNode);
+  }, []);
 
-    const NewGame = new Chess();
-    SetLastError('');
-    SetDetectedOpening('Starting Position');
-    BuildMoveTree(OverrideMoves, 0);
-
-    // If practicing as black, auto play the first move for white instantly
-    if (IsTrainerMode && PlayerColor === 'b' && OverrideMoves.length > 0) {
-      NewGame.move(OverrideMoves[0]);
-      BuildMoveTree(OverrideMoves, 1);
-    }
-    
-    SetGame(NewGame);
-  }
-
-  const AutoPlayOpponentMove = (CurrentGameCopy, MoveIndex) => {
-    if (MoveIndex >= ExpectedMoves.length) {
-      SetLastError("Opening sequence completed!");
-      return;
-    }
-
-    const NextMove = ExpectedMoves[MoveIndex];
-    
-    if (OpponentTimeoutRef.current) {
-      clearTimeout(OpponentTimeoutRef.current);
-    }
-
-    OpponentTimeoutRef.current = setTimeout(() => {
-      const AutoGameCopy = new Chess();
-      AutoGameCopy.loadPgn(CurrentGameCopy.pgn());
-      
-      const MoveResult = AutoGameCopy.move(NextMove);
-      SetGame(AutoGameCopy);
-      BuildMoveTree(ExpectedMoves, MoveIndex + 1);
-      PlaySound(!!MoveResult.captured);
-      OpponentTimeoutRef.current = null;
-    }, 500);
-  };
-
-  // Handle Tree Node clicks to jump the board state
-  const HandleNodeClick = (NodeDatum) => {
-    if (!IsTrainerMode) return;
-    
-    if (OpponentTimeoutRef.current) {
-      clearTimeout(OpponentTimeoutRef.current);
-      OpponentTimeoutRef.current = null;
-    }
-
-    const TargetIndex = NodeDatum.attributes?.index !== undefined ? parseInt(NodeDatum.attributes.index, 10) : 0;
-    
-    const NewGame = new Chess();
-    for (let i = 0; i < TargetIndex; i++) {
-      if (ExpectedMoves[i]) {
-        NewGame.move(ExpectedMoves[i]);
+  // ──────────────────────── Reset game ────────────────────────
+  const resetGame = useCallback(
+    (overrideMoves) => {
+      if (opponentTimeoutRef.current) {
+        clearTimeout(opponentTimeoutRef.current);
+        opponentTimeoutRef.current = null;
       }
+
+      const moves = overrideMoves || expectedMoves;
+      const fresh = new Chess();
+      setLastError('');
+      setDetectedOpening('Starting Position');
+      buildMoveTree(moves, 0);
+
+      // If practicing as black, auto-play the first move for white
+      if (isTrainerMode && playerColor === 'b' && moves.length > 0) {
+        try {
+          fresh.move(moves[0]);
+          buildMoveTree(moves, 1);
+        } catch {
+          // First move invalid — leave board at start
+        }
+      }
+
+      setGame(fresh);
+    },
+    [expectedMoves, isTrainerMode, playerColor, buildMoveTree]
+  );
+
+  // ──────────────────────── Sync target opening ────────────────────────
+  useEffect(() => {
+    if (targetOpening) {
+      const moves = pgnToMoves(targetOpening.Moves);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setExpectedMoves(moves);
+
+      // Reset with the new moves
+      if (opponentTimeoutRef.current) {
+        clearTimeout(opponentTimeoutRef.current);
+        opponentTimeoutRef.current = null;
+      }
+
+      const fresh = new Chess();
+      setLastError('');
+      setDetectedOpening('Starting Position');
+      buildMoveTree(moves, 0);
+
+      if (isTrainerMode && playerColor === 'b' && moves.length > 0) {
+        try {
+          fresh.move(moves[0]);
+          buildMoveTree(moves, 1);
+        } catch {
+          // ignore
+        }
+      }
+
+      setGame(fresh);
     }
-    SetGame(NewGame);
-    BuildMoveTree(ExpectedMoves, TargetIndex);
-    SetLastError('');
-    PlaySound(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetOpening, playerColor, isTrainerMode]);
 
-    // Trigger opponent response if it's their turn
-    if (PlayerColor === 'w' && TargetIndex % 2 !== 0) {
-      AutoPlayOpponentMove(NewGame, TargetIndex);
-    } else if (PlayerColor === 'b' && TargetIndex % 2 === 0) {
-      AutoPlayOpponentMove(NewGame, TargetIndex);
-    }
-  };
+  // ──────────────────────── Stockfish evaluation ────────────────────────
+  useEffect(() => {
+    const worker = engineWorkerRef.current;
+    if (!worker) return;
 
-  const EvaluateDeviation = async (ExpectedFen, ActualFen, ExpectedMove, PlayedMove) => {
-    SetLastError('Analyzing mistake...');
-    
-    const GetScoreFromWhitePerspective = (Fen) => {
-      return new Promise((resolve) => {
-        const wasmSupported = typeof WebAssembly === 'object' && WebAssembly.validate(Uint8Array.of(0x0, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00));
-        const TempWorker = new Worker(wasmSupported ? '/stockfish.wasm.js' : '/stockfish.js');
-        let Score = 0;
-        let TimeoutId = null;
-        
-        const Cleanup = () => {
-          if (TimeoutId) clearTimeout(TimeoutId);
-          TempWorker.terminate();
-        };
+    worker.postMessage('stop');
+    setIsEvaluating(true);
 
-        const Listener = (e) => {
-          const Line = e.data;
-          if (typeof Line !== 'string') return;
-          if (Line.includes('info depth')) {
-            const CpMatch = Line.match(/score cp (-?\d+)/);
-            if (CpMatch) {
-              Score = parseInt(CpMatch[1], 10) / 100;
-            }
-          }
-          if (Line.startsWith('bestmove')) {
-            Cleanup();
-            const IsWhite = Fen.split(' ')[1] === 'w';
-            resolve(IsWhite ? Score : -Score);
-          }
-        };
+    const fen = game.fen();
+    const isWhiteToMove = fen.split(' ')[1] === 'w';
 
-        TimeoutId = setTimeout(() => {
-          Cleanup();
-          resolve(Score);
-        }, 3000);
+    const listener = (e) => {
+      const line = e.data;
+      if (typeof line !== 'string') return;
 
-        TempWorker.addEventListener('message', Listener);
-        TempWorker.postMessage('ucinewgame');
-        TempWorker.postMessage('position fen ' + Fen);
-        TempWorker.postMessage('go depth 12');
-      });
+      if (line.includes('info depth')) {
+        const cpMatch = line.match(/score cp (-?\d+)/);
+        const mateMatch = line.match(/score mate (-?\d+)/);
+        if (cpMatch) {
+          const score = parseInt(cpMatch[1], 10) / 100;
+          setEvalScore(isWhiteToMove ? score : -score);
+          setEvalType('cp');
+        } else if (mateMatch) {
+          const mateIn = parseInt(mateMatch[1], 10);
+          setEvalScore(isWhiteToMove ? mateIn : -mateIn);
+          setEvalType('mate');
+        }
+      }
+
+      if (line.startsWith('bestmove')) {
+        setIsEvaluating(false);
+        worker.removeEventListener('message', listener);
+      }
     };
 
-    const ExpectedScore = await GetScoreFromWhitePerspective(ExpectedFen);
-    const ActualScore = await GetScoreFromWhitePerspective(ActualFen);
-    
-    const Drop = PlayerColor === 'w' ? (ExpectedScore - ActualScore) : (ActualScore - ExpectedScore);
-    
-    SetLastError(`Mistake! Expected ${ExpectedMove}, but you played ${PlayedMove}. Evaluation dropped by ${Math.max(0, Drop).toFixed(1)} points.`);
-  };
+    worker.addEventListener('message', listener);
+    worker.postMessage('ucinewgame');
+    worker.postMessage('position fen ' + fen);
+    worker.postMessage('go depth 12');
 
-  function OnPieceDrop(sourceSquare, targetSquare) {
-    const GameCopy = new Chess();
-    try {
-      GameCopy.loadPgn(Game.pgn());
-    } catch (pgnErr) {
-      console.error("Failed to load PGN:", pgnErr);
-    }
-    const CurrentMoveIndex = GameCopy.history().length;
+    return () => {
+      worker.postMessage('stop');
+      worker.removeEventListener('message', listener);
+    };
+  }, [game]);
 
-    // Reject move immediately if it is not the user's turn to move in Trainer Mode
-    if (IsTrainerMode) {
-      const isPlayerTurn = (PlayerColor === 'w' && CurrentMoveIndex % 2 === 0) || 
-                            (PlayerColor === 'b' && CurrentMoveIndex % 2 !== 0);
-      if (!isPlayerTurn) {
-        return false;
+  // ──────────────────────── Auto-play opponent move ────────────────────────
+  const autoPlayOpponentMove = useCallback(
+    (currentGame, moveIndex, moves) => {
+      const targetMoves = moves || expectedMoves;
+      if (moveIndex >= targetMoves.length) {
+        setLastError('Opening sequence completed! 🎉');
+        return;
       }
-    }
 
-    try {
-      const MoveResult = GameCopy.move({ from: sourceSquare, to: targetSquare, promotion: "q" });
-      if (MoveResult === null) return false;
+      const nextMove = targetMoves[moveIndex];
 
-      // Play Move/Capture sound effect
-      PlaySound(!!MoveResult.captured);
+      if (opponentTimeoutRef.current) {
+        clearTimeout(opponentTimeoutRef.current);
+      }
 
-      if (IsTrainerMode) {
-        const ExpectedMove = ExpectedMoves[CurrentMoveIndex];
+      opponentTimeoutRef.current = setTimeout(() => {
+        const copy = cloneGame(currentGame);
+        try {
+          const result = copy.move(nextMove);
+          if (result) {
+            setGame(copy);
+            buildMoveTree(targetMoves, moveIndex + 1);
+            playSound(!!result.captured);
+          }
+        } catch {
+          // opponent move failed — leave board as is
+        }
+        opponentTimeoutRef.current = null;
+      }, 500);
+    },
+    [expectedMoves, buildMoveTree, playSound]
+  );
 
-        if (MoveResult.san !== ExpectedMove) {
-          // Check if deviation is valid opening theory
-          let AlternativeOpeningName = null;
-          if (Openings) {
-            // lookupByMoves mutates the chess object (calls undo/load which wipes move history)
-            // so we must pass a defensive copy, never the real game or working copy
-            const LookupCopy = new Chess();
-            LookupCopy.loadPgn(GameCopy.pgn());
-            const Result = lookupByMoves(LookupCopy, Openings);
-            if (Result && Result.opening && Result.opening.name) {
-              AlternativeOpeningName = Result.opening.name;
-            }
+  // ──────────────────────── Tree node click handler ────────────────────────
+  const handleNodeClick = useCallback(
+    (nodeDatum) => {
+      if (!isTrainerMode) return;
+
+      if (opponentTimeoutRef.current) {
+        clearTimeout(opponentTimeoutRef.current);
+        opponentTimeoutRef.current = null;
+      }
+
+      const targetIndex =
+        nodeDatum.attributes?.index !== undefined
+          ? parseInt(nodeDatum.attributes.index, 10)
+          : 0;
+
+      const fresh = new Chess();
+      for (let i = 0; i < targetIndex && i < expectedMoves.length; i++) {
+        try { fresh.move(expectedMoves[i]); } catch { break; }
+      }
+
+      setGame(fresh);
+      buildMoveTree(expectedMoves, targetIndex);
+      setLastError('');
+      playSound(false);
+
+      // Trigger opponent response if it's their turn after the jump
+      const isOpponentTurn =
+        (playerColor === 'w' && targetIndex % 2 !== 0) ||
+        (playerColor === 'b' && targetIndex % 2 === 0);
+      if (isOpponentTurn && targetIndex < expectedMoves.length) {
+        autoPlayOpponentMove(fresh, targetIndex);
+      }
+    },
+    [isTrainerMode, expectedMoves, playerColor, buildMoveTree, playSound, autoPlayOpponentMove]
+  );
+
+  // ──────────────────────── Evaluate deviation via Stockfish ────────────────────────
+  const evaluateDeviation = useCallback(
+    async (expectedFen, actualFen, expectedMove, playedMove) => {
+      setLastError('Analyzing mistake...');
+
+      const getScore = (fen) =>
+        new Promise((resolve) => {
+          let tempWorker;
+          try {
+            const wasmSupported =
+              typeof WebAssembly === 'object' &&
+              WebAssembly.validate(Uint8Array.of(0x0, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00));
+            tempWorker = new Worker(wasmSupported ? '/stockfish.wasm.js' : '/stockfish.js');
+          } catch {
+            resolve(0);
+            return;
           }
 
-          if (AlternativeOpeningName) {
-            SetLastError(`Valid Theory! You played the ${AlternativeOpeningName}. Great move, but we are practicing the ${TargetOpening.Name}. Try again!`);
+          let score = 0;
+          const timeout = setTimeout(() => {
+            tempWorker.terminate();
+            resolve(score);
+          }, 3000);
+
+          const handler = (e) => {
+            const line = e.data;
+            if (typeof line !== 'string') return;
+            if (line.includes('info depth')) {
+              const cpMatch = line.match(/score cp (-?\d+)/);
+              if (cpMatch) score = parseInt(cpMatch[1], 10) / 100;
+            }
+            if (line.startsWith('bestmove')) {
+              clearTimeout(timeout);
+              tempWorker.terminate();
+              const isWhite = fen.split(' ')[1] === 'w';
+              resolve(isWhite ? score : -score);
+            }
+          };
+
+          tempWorker.addEventListener('message', handler);
+          tempWorker.postMessage('ucinewgame');
+          tempWorker.postMessage('position fen ' + fen);
+          tempWorker.postMessage('go depth 12');
+        });
+
+      const expectedScore = await getScore(expectedFen);
+      const actualScore = await getScore(actualFen);
+
+      const drop =
+        playerColor === 'w'
+          ? expectedScore - actualScore
+          : actualScore - expectedScore;
+
+      setLastError(
+        `Mistake! Expected ${expectedMove}, but you played ${playedMove}. Evaluation dropped by ${Math.max(0, drop).toFixed(1)} points.`
+      );
+    },
+    [playerColor]
+  );
+
+  // ──────────────────────── Piece drop handler ────────────────────────
+  const onPieceDrop = useCallback(
+    (sourceSquare, targetSquare, piece) => {
+      // Create a fresh clone of the current game state
+      const gameCopy = cloneGame(game);
+      const currentMoveIndex = gameCopy.history().length;
+
+      // In Trainer Mode, only allow the player to move on their own turn
+      if (isTrainerMode) {
+        const isPlayerTurn =
+          (playerColor === 'w' && currentMoveIndex % 2 === 0) ||
+          (playerColor === 'b' && currentMoveIndex % 2 !== 0);
+        if (!isPlayerTurn) return false;
+      }
+
+      // Determine promotion piece from the dragged piece string (e.g. "wQ" -> "q")
+      let promotion = 'q';
+      if (piece && piece.length === 2) {
+        const p = piece[1].toLowerCase();
+        if (['q', 'r', 'b', 'n'].includes(p)) promotion = p;
+      }
+
+      try {
+        const moveResult = gameCopy.move({
+          from: sourceSquare,
+          to: targetSquare,
+          promotion,
+        });
+        if (moveResult === null) return false;
+
+        // Play sound effect
+        playSound(!!moveResult.captured);
+
+        if (isTrainerMode) {
+          const expectedMove = expectedMoves[currentMoveIndex];
+
+          if (moveResult.san !== expectedMove) {
+            // Check if the deviation is valid opening theory
+            let alternativeOpeningName = null;
+            if (openings) {
+              try {
+                // Defensive copy: lookupByMoves calls undo/load internally
+                const lookupCopy = cloneGame(gameCopy);
+                const result = lookupByMoves(lookupCopy, openings);
+                if (result?.opening?.name) {
+                  alternativeOpeningName = result.opening.name;
+                }
+              } catch {
+                // ECO lookup failed — treat as non-theory move
+              }
+            }
+
+            if (alternativeOpeningName) {
+              setLastError(
+                `Valid Theory! You played the ${alternativeOpeningName}. Great move, but we are practicing the ${targetOpening.Name}. Try again!`
+              );
+              return false;
+            }
+
+            // Evaluate deviation with Stockfish
+            try {
+              const expectedGameCopy = cloneGame(game);
+              expectedGameCopy.move(expectedMove);
+              evaluateDeviation(
+                expectedGameCopy.fen(),
+                gameCopy.fen(),
+                expectedMove,
+                moveResult.san
+              );
+            } catch {
+              setLastError(
+                `Wrong move! Expected ${expectedMove}, but you played ${moveResult.san}.`
+              );
+            }
             return false;
           }
 
-          // Otherwise, evaluate deviation with Stockfish
-          const ExpectedGameCopy = new Chess();
-          ExpectedGameCopy.loadPgn(Game.pgn());
-          ExpectedGameCopy.move(ExpectedMove);
-          
-          EvaluateDeviation(ExpectedGameCopy.fen(), GameCopy.fen(), ExpectedMove, MoveResult.san);
-          return false;
+          // Correct move in trainer mode
+          setLastError('');
+          setGame(gameCopy);
+          buildMoveTree(expectedMoves, currentMoveIndex + 1);
+
+          // Auto-play opponent's response
+          autoPlayOpponentMove(gameCopy, currentMoveIndex + 1);
+          return true;
         }
 
-        SetLastError('');
-        SetGame(GameCopy);
-        BuildMoveTree(ExpectedMoves, CurrentMoveIndex + 1);
-
-        // Auto opponent response
-        AutoPlayOpponentMove(GameCopy, CurrentMoveIndex + 1);
+        // ──── Observation mode ────
+        setLastError('');
+        if (openings) {
+          try {
+            const lookupCopy = cloneGame(gameCopy);
+            const result = lookupByMoves(lookupCopy, openings);
+            setDetectedOpening(
+              result?.opening?.name || 'Unknown Position'
+            );
+          } catch {
+            setDetectedOpening('Unknown Position');
+          }
+        }
+        setGame(gameCopy);
         return true;
+      } catch {
+        return false;
       }
+    },
+    [
+      game,
+      isTrainerMode,
+      playerColor,
+      expectedMoves,
+      openings,
+      targetOpening,
+      playSound,
+      buildMoveTree,
+      autoPlayOpponentMove,
+      evaluateDeviation,
+    ]
+  );
 
-      // Observation mode
-      SetLastError('');
-      if (Openings) {
-        // lookupByMoves mutates the chess object (calls undo/load which wipes move history)
-        // so we must pass a defensive copy, never the real game or working copy
-        const LookupCopy = new Chess();
-        LookupCopy.loadPgn(GameCopy.pgn());
-        const Result = lookupByMoves(LookupCopy, Openings);
-        SetDetectedOpening(Result && Result.opening ? Result.opening.name : 'Unknown Position');
-      }
-      SetGame(GameCopy);
-      return true;
+  // ──────────────────────── Custom opening CRUD ────────────────────────
+  const handleSaveOpening = useCallback(
+    (e) => {
+      e.preventDefault();
+      setAddError('');
 
-    } catch (e) {
-      console.error("Caught error in OnPieceDrop try-catch:", e);
-      return false;
-    }
-  }
-
-  // Custom Opening Addition
-  const HandleSaveOpening = (e) => {
-    e.preventDefault();
-    SetAddError('');
-
-    if (!NewOpeningName.trim()) {
-      SetAddError('Opening name is required.');
-      return;
-    }
-    if (!NewOpeningMoves.trim()) {
-      SetAddError('Moves list is required.');
-      return;
-    }
-
-    const TempGame = new Chess();
-    try {
-      TempGame.loadPgn(NewOpeningMoves);
-      if (TempGame.history().length === 0) {
-        SetAddError('Unable to extract moves from input. Format: 1. e4 e5 2. Nf3 Nc6');
+      if (!newOpeningName.trim()) {
+        setAddError('Opening name is required.');
         return;
       }
-    } catch (err) {
-      SetAddError(`Invalid PGN formatting: ${err.message}`);
-      return;
-    }
+      if (!newOpeningMoves.trim()) {
+        setAddError('Moves list is required.');
+        return;
+      }
 
-    const NewItem = {
-      Name: NewOpeningName.trim(),
-      Moves: NewOpeningMoves.trim()
-    };
+      const moves = pgnToMoves(newOpeningMoves);
+      if (moves.length === 0) {
+        setAddError('Unable to extract moves from input. Format: 1. e4 e5 2. Nf3 Nc6');
+        return;
+      }
 
-    const UpdatedRepertoire = [...Repertoire, NewItem];
-    SetRepertoire(UpdatedRepertoire);
-    localStorage.setItem('chess_repertoire', JSON.stringify(UpdatedRepertoire));
-    SetTargetOpening(NewItem);
+      const newItem = { Name: newOpeningName.trim(), Moves: newOpeningMoves.trim() };
+      const updated = [...repertoire, newItem];
+      setRepertoire(updated);
+      localStorage.setItem('chess_repertoire', JSON.stringify(updated));
+      setTargetOpening(newItem);
+      setNewOpeningName('');
+      setNewOpeningMoves('');
+      setAddModalOpen(false);
+    },
+    [newOpeningName, newOpeningMoves, repertoire]
+  );
 
-    // Reset Form
-    SetNewOpeningName('');
-    SetNewOpeningMoves('');
-    SetAddModalOpen(false);
-  };
+  const handleDeleteOpening = useCallback(
+    (name) => {
+      const updated = repertoire.filter((op) => op.Name !== name);
+      if (updated.length === 0) {
+        setLastError('Cannot delete all openings. Keep at least one.');
+        return;
+      }
+      setRepertoire(updated);
+      localStorage.setItem('chess_repertoire', JSON.stringify(updated));
+      if (targetOpening.Name === name) {
+        setTargetOpening(updated[0]);
+      }
+    },
+    [repertoire, targetOpening]
+  );
 
-  const HandleDeleteOpening = (Name) => {
-    const Updated = Repertoire.filter(op => op.Name !== Name);
-    if (Updated.length === 0) {
-      SetLastError("Cannot delete all openings. Keep at least one opening in the list.");
-      return;
-    }
-    SetRepertoire(Updated);
-    localStorage.setItem('chess_repertoire', JSON.stringify(Updated));
-    if (TargetOpening.Name === Name) {
-      SetTargetOpening(Updated[0]);
-    }
-  };
+  // ──────────────────────── Derived values ────────────────────────
+  const moveHistory = game.history();
+  const movePairs = [];
+  for (let i = 0; i < moveHistory.length; i += 2) {
+    movePairs.push({
+      num: Math.floor(i / 2) + 1,
+      w: moveHistory[i],
+      b: moveHistory[i + 1] || '',
+    });
+  }
 
-  // Convert Move History Array to pairs for SAN log
-  const RenderMoveHistory = () => {
-    const History = Game.history();
-    const Pairs = [];
-    for (let i = 0; i < History.length; i += 2) {
-      Pairs.push({
-        num: Math.floor(i / 2) + 1,
-        w: History[i],
-        b: History[i + 1] || ''
-      });
-    }
-    return Pairs;
-  };
+  // Evaluation bar: cp ±8 maps to 5%–95%
+  const whitePct =
+    evalType === 'mate'
+      ? evalScore > 0
+        ? 95
+        : 5
+      : Math.min(Math.max(50 + (evalScore * 50) / 8, 5), 95);
 
-  // Calculate Evaluation Bar Percentages
-  // Standard limits: cp +8 (fully white) to -8 (fully black)
-  const GetWhitePercentage = () => {
-    if (EvalType === 'mate') {
-      return EvalScore > 0 ? 95 : 5;
-    }
-    return Math.min(Math.max(50 + (EvalScore * 50 / 8), 5), 95);
-  };
-
-  const WhitePct = GetWhitePercentage();
-
-
-
+  // ──────────────────────── Render ────────────────────────
   return (
     <div className="flex h-screen w-full bg-stone-950 text-stone-100 overflow-hidden font-sans">
-      
-      {/* Sidebar - Control and Analysis Panel */}
+      {/* ─── Sidebar ─── */}
       <div className="w-[420px] flex flex-col border-r border-stone-800 bg-stone-900 shadow-2xl z-10 relative">
-        
-        {/* Sidebar Header */}
+        {/* Header */}
         <div className="p-5 border-b border-stone-800 flex flex-col gap-3">
           <div className="flex justify-between items-center">
             <h1 className="text-xl font-bold font-serif text-[#b58863] flex items-center gap-2 tracking-wide">
               <span>Chess Repertoire Trainer</span>
             </h1>
             <div className="flex gap-2">
-              <button 
-                onClick={() => SetMuted(!Muted)} 
-                className="p-1.5 rounded-lg bg-stone-850 hover:bg-stone-800 text-stone-300 transition-colors"
-                title={Muted ? "Unmute sound effects" : "Mute sound effects"}
+              <button
+                onClick={() => setMuted(!muted)}
+                className="p-1.5 rounded-lg hover:bg-stone-800 text-stone-300 transition-colors"
+                title={muted ? 'Unmute sound effects' : 'Mute sound effects'}
               >
-                {Muted ? <VolumeX className="w-4 h-4 text-stone-400" /> : <Volume2 className="w-4 h-4 text-stone-300" />}
+                {muted ? (
+                  <VolumeX className="w-4 h-4 text-stone-400" />
+                ) : (
+                  <Volume2 className="w-4 h-4 text-stone-300" />
+                )}
               </button>
-              <button 
-                onClick={() => ResetGame()} 
-                className="p-1.5 rounded-lg bg-stone-850 hover:bg-stone-800 text-stone-300 transition-colors"
+              <button
+                onClick={() => resetGame()}
+                className="p-1.5 rounded-lg hover:bg-stone-800 text-stone-300 transition-colors"
                 title="Reset active board"
               >
                 <RefreshCw className="w-4 h-4" />
               </button>
             </div>
           </div>
-          
-          {/* Mode Switcher Buttons */}
+
+          {/* Mode Switcher */}
           <div className="grid grid-cols-2 gap-2 bg-stone-950 p-1 rounded-lg border border-stone-800">
-            <button 
-              onClick={() => SetIsTrainerMode(false)}
-              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${!IsTrainerMode ? 'bg-[#b58863] text-stone-950 shadow-md font-bold' : 'text-stone-400 hover:text-stone-200'}`}
+            <button
+              onClick={() => setIsTrainerMode(false)}
+              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                !isTrainerMode
+                  ? 'bg-[#b58863] text-stone-950 shadow-md font-bold'
+                  : 'text-stone-400 hover:text-stone-200'
+              }`}
             >
               <Eye className="w-3.5 h-3.5" />
               <span>Observation</span>
             </button>
-            <button 
-              onClick={() => SetIsTrainerMode(true)}
-              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${IsTrainerMode ? 'bg-[#b58863] text-stone-950 shadow-md font-bold' : 'text-stone-400 hover:text-stone-200'}`}
+            <button
+              onClick={() => setIsTrainerMode(true)}
+              className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                isTrainerMode
+                  ? 'bg-[#b58863] text-stone-950 shadow-md font-bold'
+                  : 'text-stone-400 hover:text-stone-200'
+              }`}
             >
               <BookOpen className="w-3.5 h-3.5" />
               <span>Trainer Mode</span>
@@ -580,25 +698,26 @@ export default function App() {
           </div>
         </div>
 
-        {/* Sidebar Content Body */}
+        {/* Sidebar Body */}
         <div className="flex-1 overflow-y-auto p-5 space-y-5">
-          {IsLoadingEco ? (
+          {isLoadingEco ? (
             <div className="flex flex-col items-center justify-center h-full gap-2 py-10">
               <Loader2 className="w-8 h-8 animate-spin text-[#b58863]" />
               <span className="text-sm text-stone-400 font-medium">Loading ECO database...</span>
             </div>
           ) : (
             <div className="space-y-4">
-              
-              {/* Trainer Mode Selection Panel */}
-              {IsTrainerMode ? (
+              {/* Trainer Mode Panel */}
+              {isTrainerMode ? (
                 <div className="bg-stone-950/40 border border-stone-800/80 p-4 rounded-xl space-y-4 shadow-inner">
-                  {/* Select Opening Row */}
+                  {/* Opening selector */}
                   <div>
                     <div className="flex justify-between items-center mb-1.5">
-                      <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Target opening</label>
-                      <button 
-                        onClick={() => SetAddModalOpen(true)}
+                      <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider">
+                        Target opening
+                      </label>
+                      <button
+                        onClick={() => setAddModalOpen(true)}
                         className="text-xs text-[#b58863] hover:text-[#c99c75] flex items-center gap-0.5 font-medium hover:underline"
                       >
                         <Plus className="w-3.5 h-3.5" />
@@ -606,41 +725,56 @@ export default function App() {
                       </button>
                     </div>
                     <div className="flex gap-2">
-                      <select 
-                        value={TargetOpening.Name}
+                      <select
+                        value={targetOpening.Name}
                         onChange={(e) => {
-                          const Selected = Repertoire.find(Op => Op.Name === e.target.value);
-                          if (Selected) SetTargetOpening(Selected);
+                          const selected = repertoire.find((op) => op.Name === e.target.value);
+                          if (selected) setTargetOpening(selected);
                         }}
                         className="flex-1 bg-stone-900 border border-stone-800 rounded-lg p-2 text-sm text-stone-200 focus:outline-none focus:border-[#b58863]"
                       >
-                        {Repertoire.map(Op => <option key={Op.Name} value={Op.Name}>{Op.Name}</option>)}
+                        {repertoire.map((op) => (
+                          <option key={op.Name} value={op.Name}>
+                            {op.Name}
+                          </option>
+                        ))}
                       </select>
-                      {Repertoire.length > 1 && !PopularOpenings.some(pop => pop.Name === TargetOpening.Name) && (
-                        <button 
-                          onClick={() => HandleDeleteOpening(TargetOpening.Name)}
-                          className="p-2 bg-red-950/10 text-red-400 hover:bg-red-900/20 rounded-lg border border-red-900/20 transition-colors"
-                          title="Delete custom opening"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      )}
+                      {repertoire.length > 1 &&
+                        !PopularOpenings.some((pop) => pop.Name === targetOpening.Name) && (
+                          <button
+                            onClick={() => handleDeleteOpening(targetOpening.Name)}
+                            className="p-2 bg-red-950/10 text-red-400 hover:bg-red-900/20 rounded-lg border border-red-900/20 transition-colors"
+                            title="Delete custom opening"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        )}
                     </div>
                   </div>
 
-                  {/* Play As Select Row */}
+                  {/* Color selector */}
                   <div>
-                    <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">Practice As</label>
+                    <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">
+                      Practice As
+                    </label>
                     <div className="grid grid-cols-2 gap-2 bg-stone-900 p-1 rounded-lg border border-stone-800/50">
-                      <button 
-                        onClick={() => SetPlayerColor('w')}
-                        className={`py-1 text-xs font-medium rounded transition-all ${PlayerColor === 'w' ? 'bg-[#f0d9b5] text-stone-950 font-bold shadow' : 'text-stone-400 hover:text-stone-200'}`}
+                      <button
+                        onClick={() => setPlayerColor('w')}
+                        className={`py-1 text-xs font-medium rounded transition-all ${
+                          playerColor === 'w'
+                            ? 'bg-[#f0d9b5] text-stone-950 font-bold shadow'
+                            : 'text-stone-400 hover:text-stone-200'
+                        }`}
                       >
                         White
                       </button>
-                      <button 
-                        onClick={() => SetPlayerColor('b')}
-                        className={`py-1 text-xs font-medium rounded transition-all ${PlayerColor === 'b' ? 'bg-[#f0d9b5] text-stone-950 font-bold shadow' : 'text-stone-400 hover:text-stone-200'}`}
+                      <button
+                        onClick={() => setPlayerColor('b')}
+                        className={`py-1 text-xs font-medium rounded transition-all ${
+                          playerColor === 'b'
+                            ? 'bg-[#f0d9b5] text-stone-950 font-bold shadow'
+                            : 'text-stone-400 hover:text-stone-200'
+                        }`}
                       >
                         Black
                       </button>
@@ -648,61 +782,81 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                /* Observation Mode Context Panel */
+                /* Observation Mode Panel */
                 <div className="bg-stone-950/40 border border-stone-800 p-4 rounded-xl text-center shadow">
-                  <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider block mb-1">Detected Position Theory</span>
-                  <div className="text-base font-bold text-[#b58863] leading-tight">{DetectedOpening}</div>
+                  <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider block mb-1">
+                    Detected Position Theory
+                  </span>
+                  <div className="text-base font-bold text-[#b58863] leading-tight">
+                    {detectedOpening}
+                  </div>
                 </div>
               )}
 
-              {/* Move Visualizer Tree Diagram */}
-              {IsTrainerMode && (
+              {/* Move Tree */}
+              {isTrainerMode && (
                 <div className="bg-stone-950/40 border border-stone-800 p-4 rounded-xl overflow-hidden shadow-inner flex flex-col">
                   <div className="pb-2 border-b border-stone-800 flex items-center justify-between">
-                    <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Expected Move Sequence</span>
+                    <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">
+                      Expected Move Sequence
+                    </span>
                     <span className="text-[10px] text-stone-500 flex items-center gap-0.5">
                       <HelpCircle className="w-3 h-3" />
                       <span>Click node to jump</span>
                     </span>
                   </div>
-                  <div className="h-[220px] w-full" ref={TreeContainerRef}>
-                    <Tree 
-                      data={TreeData} 
+                  <div className="h-[220px] w-full" ref={treeContainerRef}>
+                    <Tree
+                      data={treeData}
                       orientation="vertical"
                       translate={{ x: 180, y: 35 }}
                       pathFunc="step"
                       nodeSize={{ x: 70, y: 50 }}
-                      onNodeClick={HandleNodeClick}
-                      textLayout={{ textAnchor: "middle", y: 22 }}
+                      onNodeClick={handleNodeClick}
+                      textLayout={{ textAnchor: 'middle', y: 22 }}
                       styles={{
                         links: { stroke: '#44403c', strokeWidth: 2 },
-                        nodes: { 
-                          node: { 
+                        nodes: {
+                          node: {
                             circle: { cursor: 'pointer' },
-                            name: { fill: '#e7e5e4', fontSize: 11, fontWeight: '600', fontFamily: 'monospace' } 
+                            name: {
+                              fill: '#e7e5e4',
+                              fontSize: 11,
+                              fontWeight: '600',
+                              fontFamily: 'monospace',
+                            },
                           },
-                          leafNode: { 
+                          leafNode: {
                             circle: { cursor: 'pointer' },
-                            name: { fill: '#e7e5e4', fontSize: 11, fontWeight: '600', fontFamily: 'monospace' } 
-                          } 
-                        }
+                            name: {
+                              fill: '#e7e5e4',
+                              fontSize: 11,
+                              fontWeight: '600',
+                              fontFamily: 'monospace',
+                            },
+                          },
+                        },
                       }}
                     />
                   </div>
                 </div>
               )}
 
-              {/* Game Notation Scroll Panel */}
+              {/* Move Log */}
               <div className="bg-stone-950/30 border border-stone-800 rounded-xl overflow-hidden shadow flex flex-col">
                 <div className="bg-stone-900/60 px-4 py-2 border-b border-stone-800">
-                  <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Move Log</span>
+                  <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">
+                    Move Log
+                  </span>
                 </div>
                 <div className="p-3 h-[180px] overflow-y-auto font-mono text-sm space-y-1 bg-stone-950/40">
-                  {RenderMoveHistory().length === 0 ? (
-                    <div className="text-stone-600 text-xs italic text-center py-10">No moves played yet.</div>
+                  {movePairs.length === 0 ? (
+                    <div className="text-stone-600 text-xs italic text-center py-10">
+                      No moves played yet.
+                    </div>
                   ) : (
                     <div className="grid grid-cols-3 gap-y-1 gap-x-4 max-w-xs text-left mx-auto">
-                      {RenderMoveHistory().map((pair) => (
+                      {movePairs.map((pair) => (
                         <div key={pair.num} className="contents">
                           <span className="text-stone-600 text-right">{pair.num}.</span>
                           <span className="text-stone-200 font-semibold">{pair.w}</span>
@@ -713,23 +867,21 @@ export default function App() {
                   )}
                 </div>
               </div>
-
             </div>
           )}
         </div>
       </div>
 
-      {/* Main Chessboard Board Area */}
+      {/* ─── Main Board Area ─── */}
       <div className="flex-1 flex flex-col items-center justify-center bg-gradient-to-br from-stone-950 via-stone-900 to-stone-950 relative p-8">
-        
-        {/* Live Evaluation/Status Display */}
+        {/* Status / Error display */}
         <div className="mb-4 text-center h-10 flex items-center justify-center">
-          {LastError ? (
+          {lastError ? (
             <div className="text-red-400 bg-red-950/30 px-4 py-1.5 rounded-lg font-mono text-xs border border-red-500/20 shadow animate-pulse">
-              {LastError}
+              {lastError}
             </div>
           ) : (
-            IsEvaluating && (
+            isEvaluating && (
               <div className="text-stone-500 font-mono text-xs flex items-center gap-1.5">
                 <Loader2 className="w-3.5 h-3.5 animate-spin text-stone-400" />
                 <span>Stockfish analyzing...</span>
@@ -738,39 +890,39 @@ export default function App() {
           )}
         </div>
 
-        {/* Board and Evaluation Bar Wrapper */}
+        {/* Board + Eval bar */}
         <div className="flex items-center">
-          
-          {/* Vertical Live Stockfish Evaluation Bar (chessboard-matching colors) */}
+          {/* Evaluation Bar */}
           <div className="mr-5 flex flex-col items-center justify-between h-[560px] w-6 bg-stone-950 border border-stone-800 rounded-md overflow-hidden relative shadow-2xl">
-            {/* Black Score Section (using board-dark color) */}
-            <div 
-              className="w-full bg-[#b58863] transition-all duration-300 ease-out" 
-              style={{ height: `${100 - WhitePct}%` }} 
+            {/* Black section */}
+            <div
+              className="w-full bg-[#b58863] transition-all duration-300 ease-out"
+              style={{ height: `${100 - whitePct}%` }}
             />
-            {/* White Score Section (using board-light color) */}
-            <div 
-              className="w-full bg-[#f0d9b5] transition-all duration-300 ease-out" 
-              style={{ height: `${WhitePct}%` }} 
+            {/* White section */}
+            <div
+              className="w-full bg-[#f0d9b5] transition-all duration-300 ease-out"
+              style={{ height: `${whitePct}%` }}
             />
-            
-            {/* Overlay Indicator Text */}
+            {/* Score label */}
             <div className="absolute inset-x-0 bottom-2 text-center pointer-events-none select-none">
               <span className="text-[9px] font-extrabold px-1 py-0.5 rounded shadow-sm bg-stone-950 text-stone-100 border border-stone-800">
-                {EvalType === 'mate' 
-                  ? (EvalScore > 0 ? `M${EvalScore}` : `-M${Math.abs(EvalScore)}`) 
-                  : `${EvalScore > 0 ? '+' : ''}${EvalScore.toFixed(1)}`
-                }
+                {evalType === 'mate'
+                  ? evalScore > 0
+                    ? `M${evalScore}`
+                    : `-M${Math.abs(evalScore)}`
+                  : `${evalScore > 0 ? '+' : ''}${evalScore.toFixed(1)}`}
               </span>
             </div>
           </div>
 
-          {/* Graphical Chessboard */}
+          {/* Chessboard */}
           <div className="w-[560px] h-[560px] relative">
-            <Chessboard 
-              position={Game.fen()}
-              boardOrientation={PlayerColor === 'w' ? 'white' : 'black'}
-              onPieceDrop={OnPieceDrop}
+            <Chessboard
+              id="main-board"
+              position={game.fen()}
+              boardOrientation={playerColor === 'w' ? 'white' : 'black'}
+              onPieceDrop={onPieceDrop}
               customDarkSquareStyle={DARK_SQUARE_STYLE}
               customLightSquareStyle={LIGHT_SQUARE_STYLE}
               customBoardStyle={BOARD_STYLE}
@@ -779,67 +931,70 @@ export default function App() {
           </div>
         </div>
 
-        {/* Visual Board Footer */}
+        {/* Footer */}
         <div className="mt-4 text-stone-500 text-[11px] font-mono select-none">
           Drag and drop pieces to play theory. Deviations trigger automatic Stockfish analysis.
         </div>
       </div>
 
-      {/* Add Custom Opening Modal Overlay */}
-      {AddModalOpen && (
+      {/* ─── Add Custom Opening Modal ─── */}
+      {addModalOpen && (
         <div className="absolute inset-0 bg-stone-950/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 transition-all">
-          <div className="w-[480px] bg-stone-900 border border-stone-800 rounded-2xl shadow-2xl overflow-hidden animate-in fade-in zoom-in duration-250">
+          <div className="w-[480px] bg-stone-900 border border-stone-800 rounded-2xl shadow-2xl overflow-hidden">
             {/* Modal Header */}
             <div className="px-5 py-4 border-b border-stone-800 flex justify-between items-center bg-stone-950/30">
               <h3 className="text-base font-bold text-stone-200">Add Custom Practice Opening</h3>
-              <button 
-                onClick={() => SetAddModalOpen(false)}
+              <button
+                onClick={() => setAddModalOpen(false)}
                 className="text-stone-400 hover:text-stone-200 p-1 hover:bg-stone-800 rounded-lg transition-colors"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
-            
+
             {/* Modal Form */}
-            <form onSubmit={HandleSaveOpening} className="p-5 space-y-4">
+            <form onSubmit={handleSaveOpening} className="p-5 space-y-4">
               <div>
-                <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">Opening Name</label>
-                <input 
-                  type="text" 
-                  value={NewOpeningName}
-                  onChange={(e) => SetNewOpeningName(e.target.value)}
+                <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">
+                  Opening Name
+                </label>
+                <input
+                  type="text"
+                  value={newOpeningName}
+                  onChange={(e) => setNewOpeningName(e.target.value)}
                   placeholder="e.g. Sicilian Defense: Najdorf Variation"
                   className="w-full bg-stone-950 border border-stone-800 focus:border-[#b58863] rounded-lg p-2.5 text-sm text-stone-200 focus:outline-none"
                 />
               </div>
 
               <div>
-                <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">Moves list (SAN/PGN)</label>
-                <textarea 
+                <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">
+                  Moves list (SAN/PGN)
+                </label>
+                <textarea
                   rows="3"
-                  value={NewOpeningMoves}
-                  onChange={(e) => SetNewOpeningMoves(e.target.value)}
+                  value={newOpeningMoves}
+                  onChange={(e) => setNewOpeningMoves(e.target.value)}
                   placeholder="e.g. 1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nf6 5. Nc3 a6"
                   className="w-full bg-stone-950 border border-stone-800 focus:border-[#b58863] rounded-lg p-2.5 text-sm text-stone-200 font-mono focus:outline-none resize-none"
                 />
               </div>
 
-              {AddError && (
+              {addError && (
                 <div className="text-xs text-red-400 bg-red-950/30 border border-red-500/20 p-2.5 rounded-lg font-mono">
-                  {AddError}
+                  {addError}
                 </div>
               )}
 
-              {/* Action Buttons */}
               <div className="flex justify-end gap-2 pt-2">
-                <button 
+                <button
                   type="button"
-                  onClick={() => SetAddModalOpen(false)}
-                  className="px-4 py-2 bg-stone-800 hover:bg-stone-750 text-stone-300 font-semibold rounded-lg text-xs transition-colors"
+                  onClick={() => setAddModalOpen(false)}
+                  className="px-4 py-2 bg-stone-800 hover:bg-stone-700 text-stone-300 font-semibold rounded-lg text-xs transition-colors"
                 >
                   Cancel
                 </button>
-                <button 
+                <button
                   type="submit"
                   className="px-4 py-2 bg-[#b58863] hover:bg-[#c99c75] text-stone-950 font-bold rounded-lg text-xs transition-colors"
                 >
@@ -850,7 +1005,6 @@ export default function App() {
           </div>
         </div>
       )}
-
     </div>
   );
 }
