@@ -2,18 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { Chess } from 'chess.js';
 import { Chessboard } from 'react-chessboard';
 import { openingBook, lookupByMoves } from '@chess-openings/eco.json';
-import {
-  Loader2,
-  Plus,
-  Trash2,
-  Volume2,
-  VolumeX,
-  RefreshCw,
-  Eye,
-  BookOpen,
-  HelpCircle,
-  X,
-} from 'lucide-react';
+import { Loader2, Trash2 } from 'lucide-react';
 import Tree from 'react-d3-tree';
 import './index.css';
 
@@ -64,89 +53,33 @@ function pgnToMoves(pgn) {
    ═══════════════════════════════════════════════════════════════════ */
 
 export default function App() {
-  /* ── Core state ── */
-  const [game, setGame] = useState(new Chess());
-  const [openingsDb, setOpeningsDb] = useState(null);
-  const [detectedOpening, setDetectedOpening] = useState('Starting Position');
-  const [isLoadingEco, setIsLoadingEco] = useState(true);
-  const [lastError, setLastError] = useState('');
-
-  /* ── Repertoire (localStorage-backed) ── */
-  const [repertoire, setRepertoire] = useState(() => {
-    try {
-      const s = localStorage.getItem('chess_repertoire');
-      if (s) return JSON.parse(s);
-    } catch { /* ignore */ }
-    return PopularOpenings;
+  const [Game, SetGame] = useState(new Chess());
+  const [Openings, SetOpenings] = useState(null);
+  const [DetectedOpening, SetDetectedOpening] = useState('Starting Position');
+  const [IsLoadingEco, SetIsLoadingEco] = useState(true);
+  const [LastError, SetLastError] = useState('');
+  
+  // App Mode State
+  const [AppMode, SetAppMode] = useState('Observation');
+  const [PlayerColor, SetPlayerColor] = useState('w');
+  const [TargetOpening, SetTargetOpening] = useState(PopularOpenings[0]);
+  const [ExpectedMoves, SetExpectedMoves] = useState([]);
+  const [TreeData, SetTreeData] = useState({ name: 'Start' });
+  
+  // Quiz State
+  const [QuizTargetMove, SetQuizTargetMove] = useState('');
+  const [QuizStats, SetQuizStats] = useState({ Correct: 0, Attempts: 0 });
+  const [QuizMistakes, SetQuizMistakes] = useState(0);
+  
+  // Editor State
+  const [CustomOpenings, SetCustomOpenings] = useState(() => {
+    const Saved = localStorage.getItem('CustomOpenings');
+    return Saved ? JSON.parse(Saved) : [];
   });
-
-  /* ── Trainer mode ── */
-  const [isTrainerMode, setIsTrainerMode] = useState(false);
-  const [playerColor, setPlayerColor] = useState('w');
-  const [targetOpening, setTargetOpening] = useState(() => {
-    try {
-      const s = localStorage.getItem('chess_repertoire');
-      if (s) { const p = JSON.parse(s); if (p.length) return p[0]; }
-    } catch { /* ignore */ }
-    return PopularOpenings[0];
-  });
-  const [expectedMoves, setExpectedMoves] = useState([]);
-  const [treeData, setTreeData] = useState({ name: 'Start' });
-  const [muted, setMuted] = useState(false);
-
-  /* ── Click-to-move ── */
-  const [selectedSquare, setSelectedSquare] = useState(null);
-  const [legalMoveSquares, setLegalMoveSquares] = useState([]);
-
-  /* ── Stockfish eval ── */
-  const [evalScore, setEvalScore] = useState(0.3);
-  const [evalType, setEvalType] = useState('cp');
-  const [isEvaluating, setIsEvaluating] = useState(false);
-
-  /* ── Add-opening modal ── */
-  const [addModalOpen, setAddModalOpen] = useState(false);
-  const [newOpeningName, setNewOpeningName] = useState('');
-  const [newOpeningMoves, setNewOpeningMoves] = useState('');
-  const [addError, setAddError] = useState('');
-
-  /* ── Refs ── */
-  const treeContainerRef = useRef(null);
-  const engineRef = useRef(null);
-  const opponentTimer = useRef(null);
-
-  /* ═══════════════════════════════════════════════════════════════
-     Audio synthesis
-     ═══════════════════════════════════════════════════════════════ */
-  const playSound = useCallback(
-    (isCapture = false) => {
-      if (muted) return;
-      try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        if (isCapture) {
-          osc.type = 'triangle';
-          osc.frequency.setValueAtTime(320, ctx.currentTime);
-          osc.frequency.exponentialRampToValueAtTime(140, ctx.currentTime + 0.15);
-          gain.gain.setValueAtTime(0.15, ctx.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.15);
-          osc.start();
-          osc.stop(ctx.currentTime + 0.15);
-        } else {
-          osc.type = 'sine';
-          osc.frequency.setValueAtTime(400, ctx.currentTime);
-          osc.frequency.exponentialRampToValueAtTime(260, ctx.currentTime + 0.08);
-          gain.gain.setValueAtTime(0.1, ctx.currentTime);
-          gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.08);
-          osc.start();
-          osc.stop(ctx.currentTime + 0.08);
-        }
-      } catch { /* Web Audio unavailable */ }
-    },
-    [muted],
-  );
+  const [EditorOpeningName, SetEditorOpeningName] = useState('');
+  
+  const TreeContainerRef = useRef(null);
+  const EngineWorkerRef = useRef(null);
 
   /* ═══════════════════════════════════════════════════════════════
      Stockfish worker bootstrap
@@ -178,28 +111,88 @@ export default function App() {
       .catch(() => setIsLoadingEco(false));
   }, []);
 
-  /* ═══════════════════════════════════════════════════════════════
-     Move tree builder
-     ═══════════════════════════════════════════════════════════════ */
-  const buildTree = useCallback((moves, idx) => {
-    const root = {
-      name: 'Start',
-      attributes: { status: 'Played', index: 0 },
-      nodeSvgShape: {
-        shape: 'circle',
-        shapeProps: { r: 12, fill: '#b58863', stroke: '#1c1917', strokeWidth: 2 },
-      },
-    };
-    let cur = root;
-    moves.forEach((m, i) => {
-      const played = i < idx;
-      const next = i === idx;
-      const node = {
-        name: m,
-        attributes: {
-          status: played ? 'Played' : next ? 'Next' : 'Pending',
-          index: i + 1,
-        },
+  // Parse the target opening string into an array of expected SAN moves
+  useEffect(() => {
+    if (TargetOpening) {
+      const TempGame = new Chess();
+      try {
+        TempGame.loadPgn(TargetOpening.Moves);
+        const MovesArray = TempGame.history();
+        SetExpectedMoves(MovesArray);
+        
+        // Only reset if in trainer mode, otherwise it will interfere when switching modes
+        if (AppMode === 'Trainer') {
+          ResetGame(MovesArray);
+        }
+      } catch (err) {
+        console.error("Error parsing target opening PGN", err);
+      }
+    }
+  }, [TargetOpening, PlayerColor, AppMode]);
+
+  function GenerateQuiz() {
+    const RandomIndex = Math.floor(Math.random() * PopularOpenings.length);
+    const SelectedOpening = PopularOpenings[RandomIndex];
+    const TempGame = new Chess();
+    TempGame.loadPgn(SelectedOpening.Moves);
+    const MovesArray = TempGame.history();
+    
+    // Pick a random index to stop at (ensuring it stops before the very last move)
+    const StopIndex = Math.floor(Math.random() * (MovesArray.length - 1));
+    
+    const NewGame = new Chess();
+    for (let i = 0; i <= StopIndex; i++) {
+      NewGame.move(MovesArray[i]);
+    }
+    
+    SetGame(NewGame);
+    SetQuizTargetMove(MovesArray[StopIndex + 1]);
+    SetQuizMistakes(0);
+    
+    // Automatically flip the board to match the correct player's perspective
+    const CurrentTurn = NewGame.turn();
+    SetPlayerColor(CurrentTurn);
+    
+    SetLastError(`Quiz ready! It is ${CurrentTurn === 'w' ? 'White' : 'Black'}'s turn. What is the theoretical next move?`);
+  }
+
+  function SaveCustomOpening() {
+    if (!EditorOpeningName.trim()) {
+      SetLastError("Please enter a name for your custom opening.");
+      return;
+    }
+    if (Game.history().length === 0) {
+      SetLastError("Please make at least one move to save an opening.");
+      return;
+    }
+    
+    const NewOpening = { Name: EditorOpeningName, Moves: Game.pgn() };
+    const UpdatedOpenings = [...CustomOpenings, NewOpening];
+    
+    SetCustomOpenings(UpdatedOpenings);
+    localStorage.setItem('CustomOpenings', JSON.stringify(UpdatedOpenings));
+    
+    SetEditorOpeningName('');
+    SetLastError(`Successfully saved "${NewOpening.Name}"! You can now practice it in Trainer Mode.`);
+  }
+
+  const DeleteCustomOpening = () => {
+    const UpdatedOpenings = CustomOpenings.filter(Op => Op.Name !== TargetOpening.Name);
+    SetCustomOpenings(UpdatedOpenings);
+    localStorage.setItem('CustomOpenings', JSON.stringify(UpdatedOpenings));
+    SetTargetOpening(PopularOpenings[0]);
+  };
+
+  const IsCustomOpeningSelected = CustomOpenings.some(Op => Op.Name === TargetOpening?.Name);
+
+  function BuildMoveTree(MovesArray, CurrentIndex) {
+    let RootNode = { name: 'Start', attributes: { status: 'Played' } };
+    let CurrentNode = RootNode;
+
+    MovesArray.forEach((Move, Index) => {
+      const NewNode = { 
+        name: Move, 
+        attributes: { status: Index < CurrentIndex ? 'Played' : (Index === CurrentIndex ? 'Next' : 'Pending') },
         nodeSvgShape: {
           shape: 'circle',
           shapeProps: {
@@ -238,18 +231,10 @@ export default function App() {
     [expectedMoves, isTrainerMode, playerColor, buildTree],
   );
 
-  /* ═══════════════════════════════════════════════════════════════
-     Sync when target opening / color / mode changes
-     ═══════════════════════════════════════════════════════════════ */
-  useEffect(() => {
-    if (!targetOpening) return;
-    const moves = pgnToMoves(targetOpening.Moves);
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setExpectedMoves(moves);
-
-    if (opponentTimer.current) {
-      clearTimeout(opponentTimer.current);
-      opponentTimer.current = null;
+    // Apply first move instantly to avoid timeout race conditions during setup
+    if (AppMode === 'Trainer' && PlayerColor === 'b' && OverrideMoves.length > 0) {
+      NewGame.move(OverrideMoves[0]);
+      BuildMoveTree(OverrideMoves, 1);
     }
     const fresh = new Chess();
     setLastError('');
@@ -262,55 +247,20 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targetOpening, playerColor, isTrainerMode]);
 
-  /* ═══════════════════════════════════════════════════════════════
-     Live Stockfish evaluation on every board change
-     ═══════════════════════════════════════════════════════════════ */
-  useEffect(() => {
-    const w = engineRef.current;
-    if (!w) return;
-    w.postMessage('stop');
-    setIsEvaluating(true);
-    const fen = game.fen();
-    const whiteToMove = fen.split(' ')[1] === 'w';
-
-    const listener = (e) => {
-      const l = e.data;
-      if (typeof l !== 'string') return;
-      if (l.includes('info depth')) {
-        const cp = l.match(/score cp (-?\d+)/);
-        const mt = l.match(/score mate (-?\d+)/);
-        if (cp) { setEvalScore(whiteToMove ? +cp[1] / 100 : -(+cp[1]) / 100); setEvalType('cp'); }
-        else if (mt) { setEvalScore(whiteToMove ? +mt[1] : -(+mt[1])); setEvalType('mate'); }
+    const NextMove = ExpectedMoves[MoveIndex];
+    
+    setTimeout(() => {
+      const AutoGameCopy = new Chess();
+      const AutoPastMoves = CurrentGameCopy.history();
+      for (let i = 0; i < AutoPastMoves.length; i++) {
+        AutoGameCopy.move(AutoPastMoves[i]);
       }
-      if (l.startsWith('bestmove')) { setIsEvaluating(false); w.removeEventListener('message', listener); }
-    };
-    w.addEventListener('message', listener);
-    w.postMessage('ucinewgame');
-    w.postMessage('position fen ' + fen);
-    w.postMessage('go depth 12');
-    return () => { w.postMessage('stop'); w.removeEventListener('message', listener); };
-  }, [game]);
-
-  /* ═══════════════════════════════════════════════════════════════
-     Auto-play opponent move
-     ═══════════════════════════════════════════════════════════════ */
-  const autoPlayOpponent = useCallback(
-    (currentGame, moveIdx, moves) => {
-      const target = moves || expectedMoves;
-      if (moveIdx >= target.length) { setLastError('Opening sequence completed! 🎉'); return; }
-      const next = target[moveIdx];
-      if (opponentTimer.current) clearTimeout(opponentTimer.current);
-      opponentTimer.current = setTimeout(() => {
-        const copy = cloneGame(currentGame);
-        try {
-          const r = copy.move(next);
-          if (r) { setGame(copy); buildTree(target, moveIdx + 1); playSound(!!r.captured); }
-        } catch { /* ignore */ }
-        opponentTimer.current = null;
-      }, 500);
-    },
-    [expectedMoves, buildTree, playSound],
-  );
+      
+      AutoGameCopy.move(NextMove);
+      SetGame(AutoGameCopy);
+      BuildMoveTree(ExpectedMoves, MoveIndex + 1);
+    }, 500); // 500ms delay for realism
+  };
 
   /* ═══════════════════════════════════════════════════════════════
      Tree node click → jump board position
@@ -417,53 +367,138 @@ export default function App() {
           return true;
         }
 
-        // Observation mode
-        setLastError('');
-        if (openingsDb) {
-          try {
-            const lc = cloneGame(copy);
-            const res = lookupByMoves(lc, openingsDb);
-            setDetectedOpening(res?.opening?.name || 'Unknown Position');
-          } catch { setDetectedOpening('Unknown Position'); }
-        }
-        setGame(copy);
+      EngineWorkerRef.current.addEventListener('message', Listener);
+      EngineWorkerRef.current.postMessage('ucinewgame');
+      EngineWorkerRef.current.postMessage('position fen ' + Fen);
+      EngineWorkerRef.current.postMessage('go depth 16');
+    });
+  };
+
+  const EvaluateDeviation = async (ExpectedFen, ActualFen, ExpectedMove, PlayedMove) => {
+    SetLastError('Analyzing mistake...');
+    
+    const GetScoreFromWhitePerspective = async (Fen) => {
+      const Score = await EvaluateFen(Fen);
+      if (Score === null) return 0;
+      const IsWhiteToMove = Fen.split(' ')[1] === 'w';
+      return IsWhiteToMove ? Score : -Score;
+    };
+
+    const ExpectedScore = await GetScoreFromWhitePerspective(ExpectedFen);
+    const ActualScore = await GetScoreFromWhitePerspective(ActualFen);
+    
+    let Drop = PlayerColor === 'w' ? (ExpectedScore - ActualScore) : (ActualScore - ExpectedScore);
+    
+    // Determine severity label based on the point drop
+    let SeverityLabel = "🤔 Inaccuracy";
+    if (Drop >= 1.0) {
+      SeverityLabel = "⚠️ Blunder";
+    } else if (Drop >= 0.3) {
+      SeverityLabel = "❌ Mistake";
+    }
+    
+    // Format the drop to 1 decimal place, ensuring it doesn't show negative drops if the engine finds a better line
+    const DisplayDrop = Math.max(0, Drop).toFixed(1);
+
+    SetLastError(`${SeverityLabel}! Expected ${ExpectedMove}, but you played ${PlayedMove}. (Evaluation dropped by ${DisplayDrop})`);
+  };
+
+  function OnPieceDrop(sourceSquare, targetSquare, piece) {
+    try {
+      // If the new signature is being used
+      if (sourceSquare && typeof sourceSquare === 'object' && sourceSquare.sourceSquare) {
+        targetSquare = sourceSquare.targetSquare;
+        sourceSquare = sourceSquare.sourceSquare;
+      }
+      
+      const GameCopy = new Chess();
+      const PastMoves = Game.history();
+      for (let i = 0; i < PastMoves.length; i++) {
+        GameCopy.move(PastMoves[i]);
+      }
+      const CurrentMoveIndex = GameCopy.history().length;
+
+      const MoveResult = GameCopy.move({ from: sourceSquare, to: targetSquare, promotion: "q" });
+      if (!MoveResult) return false;
+
+
+      // EDITOR MODE LOGIC
+      if (AppMode === 'Editor') {
+        SetLastError('');
+        SetGame(GameCopy);
         return true;
-      } catch { return false; }
-    },
-    [game, isTrainerMode, playerColor, expectedMoves, openingsDb, targetOpening, playSound, buildTree, autoPlayOpponent, evaluateDeviation],
-  );
-
-  /* ═══════════════════════════════════════════════════════════════
-     Click-to-move handler  (react-chessboard v5 API)
-     v5 onSquareClick receives { piece, square }
-     v5 onPieceClick receives { isSparePiece, piece, square }
-     ═══════════════════════════════════════════════════════════════ */
-  const handleSquareClick = useCallback(
-    ({ square }) => {
-      // If we already selected a piece and clicked a legal target → move
-      if (selectedSquare && legalMoveSquares.includes(square)) {
-        executeMove(selectedSquare, square);
-        setSelectedSquare(null);
-        setLegalMoveSquares([]);
-        return;
       }
 
-      // Clicked the same square → deselect
-      if (selectedSquare && square === selectedSquare) {
-        setSelectedSquare(null);
-        setLegalMoveSquares([]);
-        return;
+      // QUIZ MODE LOGIC
+      if (AppMode === 'Quiz') {
+        if (MoveResult.san === QuizTargetMove) {
+          let NewStats = { ...QuizStats, Attempts: QuizStats.Attempts + 1, Correct: QuizStats.Correct + 1 };
+          SetQuizStats(NewStats);
+          SetQuizMistakes(0); // Reset for next time
+          SetLastError("Success! You found the correct theoretical move.");
+          SetGame(GameCopy);
+          return true;
+        } else {
+          let NewStats = { ...QuizStats, Attempts: QuizStats.Attempts + 1 };
+          SetQuizStats(NewStats);
+          
+          const CurrentMistakes = QuizMistakes + 1;
+          SetQuizMistakes(CurrentMistakes);
+          
+          if (CurrentMistakes >= 5) {
+            SetLastError("Incorrect! You have run out of attempts. The expected move was " + QuizTargetMove);
+          } else {
+            const AttemptsLeft = 5 - CurrentMistakes;
+            
+            // Check for Alternative Openings (Multi-Branch Analysis)
+            let AlternativeOpeningName = null;
+            if (Openings) {
+              const Result = lookupByMoves(GameCopy, Openings);
+              if (Result && Result.opening && Result.opening.name) {
+                AlternativeOpeningName = Result.opening.name;
+              }
+            }
+
+            if (AlternativeOpeningName) {
+              SetLastError(`Valid Theory! You played the ${AlternativeOpeningName}. That is a great move, but not the theoretical move we are looking for. Try again. (${AttemptsLeft} attempts left)`);
+            } else {
+              SetLastError(`Incorrect! That is not the expected move. Try again. (${AttemptsLeft} attempts left)`);
+            }
+          }
+          return false; // Snap piece back
+        }
       }
 
-      // Try to select a piece on this square
-      const pc = game.get(square);
-      if (!pc) { setSelectedSquare(null); setLegalMoveSquares([]); return; }
+      // TRAINER MODE LOGIC
+      if (AppMode === 'Trainer') {
+        const ExpectedMove = ExpectedMoves[CurrentMoveIndex];
+
+        if (!ExpectedMove) {
+          SetLastError("Opening sequence completed! You've successfully finished this line.");
+          return false;
+        }
+
+        if (MoveResult.san !== ExpectedMove) {
+          // 1. Check if the deviated sequence is actually a known opening
+          let AlternativeOpeningName = null;
+          if (Openings) {
+            const Result = lookupByMoves(GameCopy, Openings);
+            if (Result && Result.opening && Result.opening.name) {
+              AlternativeOpeningName = Result.opening.name;
+            }
+          }
 
       // Must be that color's turn
       if (pc.color !== game.turn()) { setSelectedSquare(null); setLegalMoveSquares([]); return; }
 
-      // In trainer mode only allow own color
-      if (isTrainerMode && pc.color !== playerColor) { setSelectedSquare(null); setLegalMoveSquares([]); return; }
+          // 3. If it is NOT in the database, treat it as a real mistake and fire Stockfish
+          const ExpectedGameCopy = new Chess();
+          const ExpectedPastMoves = Game.history();
+          for (let i = 0; i < ExpectedPastMoves.length; i++) {
+            ExpectedGameCopy.move(ExpectedPastMoves[i]);
+          }
+          ExpectedGameCopy.move(ExpectedMove);
+          const ExpectedFen = ExpectedGameCopy.fen();
 
       const moves = game.moves({ square, verbose: true });
       if (moves.length === 0) { setSelectedSquare(null); setLegalMoveSquares([]); return; }
@@ -539,13 +574,18 @@ export default function App() {
     [repertoire, targetOpening],
   );
 
-  /* ═══════════════════════════════════════════════════════════════
-     Derived
-     ═══════════════════════════════════════════════════════════════ */
-  const history = game.history();
-  const movePairs = [];
-  for (let i = 0; i < history.length; i += 2) {
-    movePairs.push({ num: Math.floor(i / 2) + 1, w: history[i], b: history[i + 1] || '' });
+    } catch (error) {
+      console.error("Piece drop error:", error);
+      
+      // chess.js throws an error for illegal moves. Catch it and inform the user.
+      const Piece = Game.get(sourceSquare);
+      if (Piece && Piece.color !== Game.turn()) {
+        SetLastError(`Invalid move! It is ${Game.turn() === 'w' ? 'White' : 'Black'}'s turn.`);
+      } else {
+        SetLastError("Invalid move according to chess rules.");
+      }
+      return false;
+    }
   }
   const whitePct =
     evalType === 'mate'
@@ -569,137 +609,204 @@ export default function App() {
     animationDurationInMs: 200,
   };
 
-  /* ═══════════════════════════════════════════════════════════════
-     Render
-     ═══════════════════════════════════════════════════════════════ */
+  const SwitchMode = (NewMode) => {
+    SetAppMode(NewMode);
+    SetGame(new Chess());
+    SetLastError('');
+    if (NewMode === 'Quiz') {
+      GenerateQuiz();
+    }
+  };
+
   return (
-    <div className="flex h-screen w-full bg-stone-950 text-stone-100 overflow-hidden font-sans">
-      {/* ─── Sidebar ─── */}
-      <div className="w-[420px] flex flex-col border-r border-stone-800 bg-stone-900 shadow-2xl z-10 relative">
-        {/* Header */}
-        <div className="p-5 border-b border-stone-800 flex flex-col gap-3">
-          <div className="flex justify-between items-center">
-            <h1 className="text-xl font-bold font-serif text-[#b58863] flex items-center gap-2 tracking-wide">
-              Chess Repertoire Trainer
-            </h1>
-            <div className="flex gap-2">
-              <button onClick={() => setMuted(!muted)} className="p-1.5 rounded-lg hover:bg-stone-800 text-stone-300 transition-colors" title={muted ? 'Unmute' : 'Mute'}>
-                {muted ? <VolumeX className="w-4 h-4 text-stone-400" /> : <Volume2 className="w-4 h-4 text-stone-300" />}
+    <div className="flex h-screen w-full bg-slate-900 text-slate-100 overflow-hidden font-sans">
+      
+      {/* Sidebar Area */}
+      <div className="w-1/3 flex flex-col border-r border-slate-700 bg-slate-800 shadow-xl z-10 relative">
+        <div className="p-6 border-b border-slate-700 flex justify-between items-center">
+          <div>
+            <h1 className="text-2xl font-bold bg-gradient-to-r from-blue-400 to-emerald-400 bg-clip-text text-transparent">Opening Trainer</h1>
+            
+            {/* Mode Switcher */}
+            <div className="mt-2 flex gap-2">
+              <button 
+                onClick={() => SwitchMode('Observation')}
+                className={`px-3 py-1 text-xs rounded ${AppMode === 'Observation' ? 'bg-blue-500 text-white' : 'bg-slate-700 text-slate-300'}`}
+              >
+                Observation
               </button>
-              <button onClick={() => resetGame()} className="p-1.5 rounded-lg hover:bg-stone-800 text-stone-300 transition-colors" title="Reset board">
-                <RefreshCw className="w-4 h-4" />
+              <button 
+                onClick={() => SwitchMode('Trainer')}
+                className={`px-3 py-1 text-xs rounded ${AppMode === 'Trainer' ? 'bg-emerald-500 text-white' : 'bg-slate-700 text-slate-300'}`}
+              >
+                Trainer
+              </button>
+              <button 
+                onClick={() => SwitchMode('Quiz')}
+                className={`px-3 py-1 text-xs rounded ${AppMode === 'Quiz' ? 'bg-purple-500 text-white' : 'bg-slate-700 text-slate-300'}`}
+              >
+                Quiz
+              </button>
+              <button 
+                onClick={() => SwitchMode('Editor')}
+                className={`px-3 py-1 text-xs rounded ${AppMode === 'Editor' ? 'bg-orange-500 text-white' : 'bg-slate-700 text-slate-300'}`}
+              >
+                Editor
               </button>
             </div>
           </div>
-
-          {/* Mode switcher */}
-          <div className="grid grid-cols-2 gap-2 bg-stone-950 p-1 rounded-lg border border-stone-800">
-            <button onClick={() => setIsTrainerMode(false)} className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${!isTrainerMode ? 'bg-[#b58863] text-stone-950 shadow-md font-bold' : 'text-stone-400 hover:text-stone-200'}`}>
-              <Eye className="w-3.5 h-3.5" /><span>Observation</span>
-            </button>
-            <button onClick={() => setIsTrainerMode(true)} className={`flex items-center justify-center gap-1.5 py-1.5 text-xs font-semibold rounded-md transition-all ${isTrainerMode ? 'bg-[#b58863] text-stone-950 shadow-md font-bold' : 'text-stone-400 hover:text-stone-200'}`}>
-              <BookOpen className="w-3.5 h-3.5" /><span>Trainer Mode</span>
-            </button>
-          </div>
+          <button onClick={() => { AppMode === 'Quiz' ? GenerateQuiz() : ResetGame() }} className="px-4 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm">Reset</button>
         </div>
+        
+        <div className="flex-1 w-full flex flex-col relative overflow-hidden">
+           {IsLoadingEco ? (
+             <div className="flex items-center justify-center h-full"><Loader2 className="w-8 h-8 animate-spin text-blue-500" /></div>
+           ) : (
+             <div className="flex flex-col h-full">
+               {/* Contextual Top Area */}
+               <div className="p-6 border-b border-slate-700">
+                 {AppMode === 'Trainer' ? (
+                   <div className="w-full space-y-4">
+                     <div>
+                       <label className="text-xs text-slate-400 mb-1 block">Select Target Opening</label>
+                       <div className="flex gap-2">
+                         <select 
+                           className="flex-1 p-2 bg-slate-900 border border-slate-600 rounded text-sm text-white"
+                           value={TargetOpening?.Name || ''}
+                           onChange={(Event) => {
+                             const AllOpenings = [...PopularOpenings, ...CustomOpenings];
+                             const Selected = AllOpenings.find(Op => Op.Name === Event.target.value);
+                             SetTargetOpening(Selected);
+                           }}
+                         >
+                           {[...PopularOpenings, ...CustomOpenings].map(Op => <option key={Op.Name} value={Op.Name}>{Op.Name}</option>)}
+                         </select>
+                         {IsCustomOpeningSelected && (
+                           <button 
+                             onClick={DeleteCustomOpening}
+                             className="p-2 bg-red-900/50 hover:bg-red-800 border border-red-700 rounded text-red-400 transition-colors"
+                             title="Delete Custom Opening"
+                           >
+                             <Trash2 className="w-4 h-4" />
+                           </button>
+                         )}
+                       </div>
+                     </div>
+                     <div>
+                       <label className="text-xs text-slate-400 mb-1 block">Play As</label>
+                       <div className="flex gap-2">
+                         <button 
+                           onClick={() => SetPlayerColor('w')}
+                           className={`flex-1 py-1 text-xs rounded transition-colors ${PlayerColor === 'w' ? 'bg-slate-200 text-slate-900 font-bold' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'}`}
+                         >
+                           White
+                         </button>
+                         <button 
+                           onClick={() => SetPlayerColor('b')}
+                           className={`flex-1 py-1 text-xs rounded transition-colors ${PlayerColor === 'b' ? 'bg-slate-900 text-white font-bold border border-slate-500' : 'bg-slate-700 text-slate-300 hover:bg-slate-600'}`}
+                         >
+                           Black
+                         </button>
+                       </div>
+                     </div>
+                   </div>
+                 ) : AppMode === 'Quiz' ? (
+                   <div className="text-center">
+                     <h3 className="text-sm text-slate-400 mb-2 uppercase">Current Mode</h3>
+                     <div className="text-xl font-bold text-purple-300">Interactive Quiz</div>
+                   </div>
+                 ) : AppMode === 'Editor' ? (
+                   <div className="text-center">
+                     <h3 className="text-sm text-slate-400 mb-2 uppercase">Current Mode</h3>
+                     <div className="text-xl font-bold text-orange-300">Repertoire Builder</div>
+                   </div>
+                 ) : (
+                   <div className="text-center">
+                     <h3 className="text-sm text-slate-400 mb-2 uppercase">Current Opening</h3>
+                     <div className="text-xl font-bold text-emerald-300">{DetectedOpening}</div>
+                   </div>
+                 )}
+               </div>
 
-        {/* Body */}
-        <div className="flex-1 overflow-y-auto p-5 space-y-5">
-          {isLoadingEco ? (
-            <div className="flex flex-col items-center justify-center h-full gap-2 py-10">
-              <Loader2 className="w-8 h-8 animate-spin text-[#b58863]" />
-              <span className="text-sm text-stone-400 font-medium">Loading ECO database...</span>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              {isTrainerMode ? (
-                <div className="bg-stone-950/40 border border-stone-800/80 p-4 rounded-xl space-y-4 shadow-inner">
-                  {/* Opening selector */}
-                  <div>
-                    <div className="flex justify-between items-center mb-1.5">
-                      <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Target opening</label>
-                      <button onClick={() => setAddModalOpen(true)} className="text-xs text-[#b58863] hover:text-[#c99c75] flex items-center gap-0.5 font-medium hover:underline">
-                        <Plus className="w-3.5 h-3.5" /><span>Add Custom</span>
-                      </button>
-                    </div>
-                    <div className="flex gap-2">
-                      <select value={targetOpening.Name} onChange={(e) => { const s = repertoire.find((o) => o.Name === e.target.value); if (s) setTargetOpening(s); }} className="flex-1 bg-stone-900 border border-stone-800 rounded-lg p-2 text-sm text-stone-200 focus:outline-none focus:border-[#b58863]">
-                        {repertoire.map((o) => <option key={o.Name} value={o.Name}>{o.Name}</option>)}
-                      </select>
-                      {repertoire.length > 1 && !PopularOpenings.some((p) => p.Name === targetOpening.Name) && (
-                        <button onClick={() => handleDeleteOpening(targetOpening.Name)} className="p-2 bg-red-950/10 text-red-400 hover:bg-red-900/20 rounded-lg border border-red-900/20 transition-colors" title="Delete">
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  {/* Color selector */}
-                  <div>
-                    <label className="text-xs font-semibold text-stone-400 uppercase tracking-wider block mb-1.5">Practice As</label>
-                    <div className="grid grid-cols-2 gap-2 bg-stone-900 p-1 rounded-lg border border-stone-800/50">
-                      <button onClick={() => setPlayerColor('w')} className={`py-1 text-xs font-medium rounded transition-all ${playerColor === 'w' ? 'bg-[#f0d9b5] text-stone-950 font-bold shadow' : 'text-stone-400 hover:text-stone-200'}`}>White</button>
-                      <button onClick={() => setPlayerColor('b')} className={`py-1 text-xs font-medium rounded transition-all ${playerColor === 'b' ? 'bg-[#f0d9b5] text-stone-950 font-bold shadow' : 'text-stone-400 hover:text-stone-200'}`}>Black</button>
-                    </div>
-                  </div>
-                </div>
-              ) : (
-                <div className="bg-stone-950/40 border border-stone-800 p-4 rounded-xl text-center shadow">
-                  <span className="text-[10px] font-bold text-stone-400 uppercase tracking-wider block mb-1">Detected Position Theory</span>
-                  <div className="text-base font-bold text-[#b58863] leading-tight">{detectedOpening}</div>
-                </div>
-              )}
+               {/* Visual Move Tree Area or Quiz Dashboard */}
+               {AppMode === 'Trainer' && (
+                 <div className="flex-1 w-full bg-slate-900/50" ref={TreeContainerRef}>
+                   <Tree 
+                     data={TreeData} 
+                     orientation="vertical"
+                     translate={{ x: 150, y: 50 }}
+                     pathFunc="step"
+                     nodeSize={{ x: 80, y: 60 }}
+                     textLayout={{ textAnchor: "start", x: 15, y: 5, transform: undefined }}
+                     styles={{
+                       links: { stroke: '#475569', strokeWidth: 2 },
+                       nodes: { node: { circle: { stroke: '#1e293b', strokeWidth: 2 } }, leafNode: { circle: { stroke: '#1e293b', strokeWidth: 2 } } }
+                     }}
+                   />
+                 </div>
+               )}
 
-              {/* Move tree */}
-              {isTrainerMode && (
-                <div className="bg-stone-950/40 border border-stone-800 p-4 rounded-xl overflow-hidden shadow-inner flex flex-col">
-                  <div className="pb-2 border-b border-stone-800 flex items-center justify-between">
-                    <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Expected Move Sequence</span>
-                    <span className="text-[10px] text-stone-500 flex items-center gap-0.5"><HelpCircle className="w-3 h-3" /><span>Click node to jump</span></span>
-                  </div>
-                  <div className="h-[220px] w-full" ref={treeContainerRef}>
-                    <Tree
-                      data={treeData}
-                      orientation="vertical"
-                      translate={{ x: 180, y: 35 }}
-                      pathFunc="step"
-                      nodeSize={{ x: 70, y: 50 }}
-                      onNodeClick={handleNodeClick}
-                      textLayout={{ textAnchor: 'middle', y: 22 }}
-                      styles={{
-                        links: { stroke: '#44403c', strokeWidth: 2 },
-                        nodes: {
-                          node: { circle: { cursor: 'pointer' }, name: { fill: '#e7e5e4', fontSize: 11, fontWeight: '600', fontFamily: 'monospace' } },
-                          leafNode: { circle: { cursor: 'pointer' }, name: { fill: '#e7e5e4', fontSize: 11, fontWeight: '600', fontFamily: 'monospace' } },
-                        },
-                      }}
-                    />
-                  </div>
-                </div>
-              )}
+               {AppMode === 'Quiz' && (
+                 <div className="flex-1 w-full flex flex-col items-center justify-center p-6 bg-slate-900/50">
+                   <div className="text-center">
+                     <h2 className="text-2xl font-bold text-slate-200 mb-2">Quiz Dashboard</h2>
+                     <div className="text-6xl font-extrabold text-purple-400 mb-4">
+                       {Math.round((QuizStats.Correct / QuizStats.Attempts) * 100) || 0}%
+                     </div>
+                     <div className="text-sm text-slate-400 mb-8">
+                       Mastery ({QuizStats.Correct} / {QuizStats.Attempts} Attempts)
+                     </div>
+                     <button 
+                       onClick={GenerateQuiz}
+                       className="px-6 py-3 bg-purple-600 hover:bg-purple-500 text-white font-bold rounded-lg shadow-lg transition-colors"
+                     >
+                       Generate New Scenario
+                     </button>
+                   </div>
+                 </div>
+               )}
 
-              {/* Move log */}
-              <div className="bg-stone-950/30 border border-stone-800 rounded-xl overflow-hidden shadow flex flex-col">
-                <div className="bg-stone-900/60 px-4 py-2 border-b border-stone-800">
-                  <span className="text-xs font-semibold text-stone-400 uppercase tracking-wider">Move Log</span>
-                </div>
-                <div className="p-3 h-[180px] overflow-y-auto font-mono text-sm space-y-1 bg-stone-950/40">
-                  {movePairs.length === 0 ? (
-                    <div className="text-stone-600 text-xs italic text-center py-10">No moves played yet.</div>
-                  ) : (
-                    <div className="grid grid-cols-3 gap-y-1 gap-x-4 max-w-xs text-left mx-auto">
-                      {movePairs.map((p) => (
-                        <div key={p.num} className="contents">
-                          <span className="text-stone-600 text-right">{p.num}.</span>
-                          <span className="text-stone-200 font-semibold">{p.w}</span>
-                          <span className="text-stone-400">{p.b}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </div>
-          )}
+               {AppMode === 'Editor' && (
+                 <div className="flex-1 w-full flex flex-col p-6 bg-slate-900/50">
+                   <h2 className="text-xl font-bold text-slate-200 mb-4">Repertoire Builder</h2>
+                   <p className="text-sm text-slate-400 mb-4">Make moves on the board to record your custom sequence.</p>
+                   
+                   <div className="mb-4">
+                      <label className="text-xs text-slate-400 mb-1 block">Opening Name</label>
+                      <input 
+                        type="text" 
+                        value={EditorOpeningName}
+                        onChange={(e) => SetEditorOpeningName(e.target.value)}
+                        placeholder="e.g., My Secret Italian Line"
+                        className="w-full p-2 bg-slate-800 border border-slate-600 rounded text-sm text-white"
+                      />
+                   </div>
+                   
+                   <div className="flex gap-2">
+                     <button 
+                       onClick={SaveCustomOpening}
+                       className="flex-1 px-4 py-2 bg-orange-600 hover:bg-orange-500 text-white font-bold rounded-lg transition-colors"
+                     >
+                       Save Opening
+                     </button>
+                     <button 
+                       onClick={() => { SetGame(new Chess()); SetLastError(''); }}
+                       className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg transition-colors"
+                     >
+                       Clear
+                     </button>
+                   </div>
+                   
+                   <div className="mt-6">
+                     <h3 className="text-sm text-slate-400 mb-2 uppercase">Recorded Moves</h3>
+                     <div className="font-mono text-sm text-orange-300 break-words">
+                       {Game.pgn() || "No moves recorded yet."}
+                     </div>
+                   </div>
+                 </div>
+               )}
+             </div>
+           )}
         </div>
       </div>
 
