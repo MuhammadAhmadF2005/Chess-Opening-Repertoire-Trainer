@@ -589,6 +589,18 @@ export default function App() {
               <button onClick={() => resetGame()} className="p-1.5 rounded-lg hover:bg-stone-800 text-stone-300 transition-colors" title="Reset board">
                 <RefreshCw className="w-4 h-4" />
               </button>
+              <button 
+                onClick={() => SwitchMode('Quiz')}
+                className={`px-3 py-1 text-xs rounded ${AppMode === 'Quiz' ? 'bg-purple-500 text-white' : 'bg-slate-700 text-slate-300'}`}
+              >
+                Quiz
+              </button>
+              <button 
+                onClick={() => SwitchMode('Editor')}
+                className={`px-3 py-1 text-xs rounded ${AppMode === 'Editor' ? 'bg-orange-500 text-white' : 'bg-slate-700 text-slate-300'}`}
+              >
+                Editor
+              </button>
             </div>
           </div>
 
