@@ -67,7 +67,7 @@ An interactive, responsive React and Vite web application built to help chess pl
 
 ## How to Use the Trainer
 
-1.  **Select a Mode**: Toggle between Observation (free exploration) and Trainer (active practice).
+1.  **Select a Mode**: Toggle between Observation (free exploration) and Trainer (practice).
 2.  **Practice an Opening**:
     *   In Trainer Mode, choose an opening from the dropdown (e.g. Italian Game).
     *   Pick your color (White or Black).
